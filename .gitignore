@@ -380,3 +380,8 @@ env/
 *.slxc
 
 venv
+
+# Test script
+test.exe
+text.obj
+DroneSimDev_ENV/
