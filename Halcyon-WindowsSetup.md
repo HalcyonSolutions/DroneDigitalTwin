@@ -1,6 +1,7 @@
 ## TODO
 
-- [ ] Follow the VSCode setup
+- [x] Follow the VSCode setup
+- [ ] Set up PX4
 
 ## Getting Started
 
@@ -24,6 +25,8 @@
 - Install Unreal Engine version 5.7 
 ![Alt text](./attachments/unreal_engine_installation.png)
 
+### Setup QGroundControl
+- Download and Install for Windows [link](https://docs.qgroundcontrol.com/Stable_V5.0/en/qgc-user-guide/getting_started/download_and_install.html)
 
 ### Build AirSim
 - Open "x64 Native Tools Command Prompt for VS 2022"
@@ -46,3 +49,29 @@ If successful you're ready to run a code:
 4. PX4 Should be running, Unreal Engine Editor should be playing, you're drone must be flying
     1. Play with script in `client/python/example_user_scripts`
 5. Drone fly good, Drone no fly no good
+
+
+### Windows + WSL2 PX4 Setup
+- Following [Guide](https://microsoft.github.io/AirSim/px4_sitl_wsl2/)
+- In powershell run `ipconfig` and for Ethernet adapter vEthernet (WSL) note
+  `IPv4 Address. . . . . . . . . . . : 172.31.64.1` <-- *you have a different one, this is an example*
+- In WSL2 `export PX4_SIM_HOST_ADDR=172.31.64.1` --> verify by running `echo $PX4_SIM_HOST_ADDR`
+- On Windows make sure that the Firewall doesn't block ports:
+  Open incoming TCP port 4560 and incoming UDP port 14540 using your firewall configuration.
+- In WLS2 run `ip address show` and get your `eth0 inet` something like `172.31.66.156` <-- *just another example*
+
+*Example running px4_mission.py. Newbie friendly tutorial.*
+- In `DroneSimDev\client\python\example_user_scriptssim_config\robot_quadrotor_px4_sitl.jsonc`
+  Uncomment `local-host-ip` and add your `ipconfig WSL2` ip there
+- Uncomment `"control-ip-address": "remote",`
+- Set `qgc-host-ip` to `127.0.0.1`
+- Watch this video to start the sim: [link](https://youtu.be/Fm9hsXNZllY) 
+  *Note: Video is private for now. You can request the access!*
+
+*Note: You might need to comment out `"COM_OBL_ACT": 1` in `robot_quadrotor_px4_sitl.jsonc` and remove it from required items in `DroneSimDev\client\python\projectairsim\src\projectairsim\schema\robot_config_schema.jsonc`*
+```
+    "px4-params": {
+      "type": "object",
+      // "required": [ "NAV_RCL_ACT", "NAV_DLL_ACT", "COM_OBL_ACT", "LPE_LAT", "LPE_LON" ],
+      "required": [ "NAV_RCL_ACT", "NAV_DLL_ACT", "LPE_LAT", "LPE_LON" ],
+```
