@@ -13,6 +13,7 @@ import time
 from typing import List, Sequence
 
 from projectairsim import Drone, ProjectAirSimClient, World
+from projectairsim.drone import YawControlMode
 from projectairsim.planners import AStarPlanner
 from projectairsim.types import Pose, Quaternion, Vector3
 from projectairsim.utils import calculate_path_length, projectairsim_log
@@ -221,6 +222,7 @@ async def fly_to_point_by_velocity(
     acceptance_m: float,
     timeout_sec: float,
     report_interval_sec: float,
+    face_travel_direction: bool,
     label: str,
 ):
     await request_px4_control(drone)
@@ -258,12 +260,20 @@ async def fly_to_point_by_velocity(
         duration = min(0.5, max(0.1, distance / max(velocity_mps, 0.1)))
         speed = min(velocity_mps, distance / duration)
         velocity = [(component / distance) * speed for component in delta]
+        yaw_control_mode = (
+            YawControlMode.ForwardOnly
+            if face_travel_direction
+            else YawControlMode.MaxDegreeOfFreedom
+        )
 
         move_task = await drone.move_by_velocity_async(
             v_north=velocity[0],
             v_east=velocity[1],
             v_down=velocity[2],
             duration=duration,
+            yaw_control_mode=yaw_control_mode,
+            yaw_is_rate=not face_travel_direction,
+            yaw=0.0,
         )
         result = await move_task
         if result is False:
@@ -277,6 +287,7 @@ async def fly_path_by_velocity(
     acceptance_m: float,
     timeout_sec: float,
     report_interval_sec: float,
+    face_travel_direction: bool,
 ):
     for index, waypoint in enumerate(path[1:], start=1):
         await fly_to_point_by_velocity(
@@ -286,6 +297,7 @@ async def fly_path_by_velocity(
             acceptance_m,
             timeout_sec,
             report_interval_sec,
+            face_travel_direction,
             f"Waypoint {index:03d}",
         )
 
@@ -296,6 +308,7 @@ async def run_autopilot(args):
         port_topics=args.topics_port,
         port_services=args.services_port,
     )
+    image_display = None
 
     try:
         projectairsim_log().info("Connecting to Project AirSim")
@@ -308,6 +321,23 @@ async def run_autopilot(args):
             sim_config_path=args.sim_config_path,
         )
         drone = Drone(client, world, args.drone_name)
+
+        if args.show_chase_camera:
+            from projectairsim.image_utils import ImageDisplay
+
+            chase_window = "ChaseCam"
+            image_display = ImageDisplay(num_subwin=1)
+            image_display.add_chase_cam(
+                chase_window,
+                resize_x=args.chase_camera_width,
+                resize_y=args.chase_camera_height,
+            )
+            client.subscribe(
+                drone.sensors["Chase"]["scene_camera"],
+                lambda _, chase: image_display.receive(chase, chase_window),
+            )
+            image_display.start()
+            projectairsim_log().info("Chase camera window opened")
 
         start = args.start
         goal = args.goal
@@ -395,6 +425,7 @@ async def run_autopilot(args):
                     args.waypoint_acceptance_m,
                     args.move_timeout_sec,
                     args.pose_report_interval_sec,
+                    args.face_travel_direction,
                     "Move to start",
                 )
             else:
@@ -406,6 +437,13 @@ async def run_autopilot(args):
                     down=start[2],
                     velocity=args.velocity_mps,
                     timeout_sec=args.move_timeout_sec,
+                    yaw_control_mode=(
+                        YawControlMode.ForwardOnly
+                        if args.face_travel_direction
+                        else YawControlMode.MaxDegreeOfFreedom
+                    ),
+                    yaw_is_rate=not args.face_travel_direction,
+                    yaw=0.0,
                 )
                 await await_drone_task(
                     drone,
@@ -424,6 +462,7 @@ async def run_autopilot(args):
                 args.waypoint_acceptance_m,
                 args.move_timeout_sec,
                 args.pose_report_interval_sec,
+                args.face_travel_direction,
             )
         else:
             await request_px4_control(drone)
@@ -438,6 +477,13 @@ async def run_autopilot(args):
                 path,
                 velocity=args.velocity_mps,
                 timeout_sec=path_timeout_sec,
+                yaw_control_mode=(
+                    YawControlMode.ForwardOnly
+                    if args.face_travel_direction
+                    else YawControlMode.MaxDegreeOfFreedom
+                ),
+                yaw_is_rate=not args.face_travel_direction,
+                yaw=0.0,
                 lookahead=args.lookahead_m,
                 adaptive_lookahead=args.adaptive_lookahead,
             )
@@ -466,6 +512,8 @@ async def run_autopilot(args):
             drone.disable_api_control()
 
     finally:
+        if image_display:
+            image_display.stop()
         if client.state:
             client.disconnect()
 
@@ -505,6 +553,13 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument("--waypoint-acceptance-m", type=float, default=1.0)
+    parser.add_argument(
+        "--no-face-travel-direction",
+        dest="face_travel_direction",
+        action="store_false",
+        default=True,
+        help="Keep the existing yaw instead of yawing toward each waypoint.",
+    )
     parser.add_argument("--lookahead-m", type=float, default=-1.0)
     parser.add_argument("--adaptive-lookahead", type=float, default=1.0)
     parser.add_argument("--takeoff-timeout-sec", type=float, default=20.0)
@@ -531,6 +586,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--land-at-goal", action="store_true")
     parser.add_argument("--keep-armed", action="store_true")
     parser.add_argument("--print-waypoints", action="store_true")
+    parser.add_argument(
+        "--show-chase-camera",
+        action="store_true",
+        help="Open the drone-mounted Chase camera in a separate OpenCV window.",
+    )
+    parser.add_argument("--chase-camera-width", type=int, default=1280)
+    parser.add_argument("--chase-camera-height", type=int, default=720)
     return parser
 
 
