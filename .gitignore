@@ -344,6 +344,7 @@ unreal/**/Samples
 
 # VS Code projects
 *.code-workspace
+.vscode/launch.json
 
 # VS2019 WSL Intellisense cache
 **/out
@@ -385,3 +386,6 @@ venv
 test.exe
 text.obj
 DroneSimDev_ENV/
+
+# MISC
+test.cpp
