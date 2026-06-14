@@ -1,8 +1,3 @@
-## TODO
-
-- [x] Follow the VSCode setup
-- [ ] Set up PX4
-
 ## Getting Started
 
 *Since we want to have a full control over the simulation, we would develop with Project AirSim source*
