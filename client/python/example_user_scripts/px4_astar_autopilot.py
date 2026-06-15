@@ -332,8 +332,21 @@ async def run_autopilot(args):
                 resize_x=args.chase_camera_width,
                 resize_y=args.chase_camera_height,
             )
+            chase_topic = drone.sensors.get("Chase", {}).get("scene_camera")
+            if not chase_topic:
+                available_topics = {
+                    sensor: sorted(topics.keys())
+                    for sensor, topics in drone.sensors.items()
+                    if topics
+                }
+                raise RuntimeError(
+                    "Chase scene_camera topic is not available. Make sure the "
+                    "Chase camera capture setting has capture-enabled=true in "
+                    "the active robot config. Available sensor topics: "
+                    f"{available_topics}"
+                )
             client.subscribe(
-                drone.sensors["Chase"]["scene_camera"],
+                chase_topic,
                 lambda _, chase: image_display.receive(chase, chase_window),
             )
             image_display.start()
