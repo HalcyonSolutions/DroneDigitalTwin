@@ -62,9 +62,19 @@ class StreamStats:
 
 
 class OpenCvPreview:
-    def __init__(self, width: int, height: int):
+    def __init__(
+        self,
+        width: int,
+        height: int,
+        depth_min_m: float,
+        depth_max_m: float,
+        depth_invert: bool,
+    ):
         self.width = width
         self.height = height
+        self.depth_min_m = max(0.0, depth_min_m)
+        self.depth_max_m = max(depth_max_m, self.depth_min_m + 0.001)
+        self.depth_invert = depth_invert
         self.windows: Dict[str, Dict] = {}
         self.running = False
         self.thread = None
@@ -149,18 +159,19 @@ class OpenCvPreview:
     def _depth_to_colormap(self, frame):
         import cv2
 
-        depth = np.asarray(frame).squeeze()
-        valid_depth = depth[depth > 0]
-        if valid_depth.size == 0:
-            normalized = np.zeros(depth.shape, dtype=np.uint8)
-        else:
-            high = np.percentile(valid_depth, 95)
-            if high <= 0:
-                high = valid_depth.max()
-            normalized = np.clip(depth.astype(np.float32) / high * 255.0, 0, 255).astype(
-                np.uint8
-            )
-        return cv2.applyColorMap(normalized, cv2.COLORMAP_TURBO)
+        depth_mm = np.asarray(frame).squeeze().astype(np.float32)
+        valid_mask = depth_mm > 0
+        min_mm = self.depth_min_m * 1000.0
+        max_mm = self.depth_max_m * 1000.0
+
+        clipped = np.clip(depth_mm, min_mm, max_mm)
+        normalized = (clipped - min_mm) / (max_mm - min_mm)
+        if self.depth_invert:
+            normalized = 1.0 - normalized
+
+        preview = (normalized * 255.0).astype(np.uint8)
+        preview[~valid_mask] = 0
+        return cv2.applyColorMap(preview, cv2.COLORMAP_TURBO)
 
 
 def selected_modes(camera: str) -> Iterable[str]:
@@ -186,9 +197,12 @@ def summarize_depth(image) -> str:
         valid = frame[frame > 0]
         if valid.size == 0:
             return f"{summarize_image(image)}, depth=no valid pixels"
+        valid_m = valid.astype(np.float32) / 1000.0
         return (
-            f"{summarize_image(image)}, depth_min={valid.min()}, "
-            f"depth_max={valid.max()}"
+            f"{summarize_image(image)}, depth_min_m={valid_m.min():.2f}, "
+            f"depth_p50_m={np.percentile(valid_m, 50):.2f}, "
+            f"depth_p95_m={np.percentile(valid_m, 95):.2f}, "
+            f"depth_max_m={valid_m.max():.2f}"
         )
     except Exception as exc:
         return f"{summarize_image(image)}, depth_stats_error={exc}"
@@ -293,6 +307,9 @@ async def run_flight_pattern(drone: Drone, velocity_mps: float):
 
 async def main(args):
     modes = tuple(selected_modes(args.camera))
+    if args.depth_max_m <= args.depth_min_m:
+        raise ValueError("--depth-max-m must be greater than --depth-min-m")
+
     stats = {mode: StreamStats(mode) for mode in modes}
     client = ProjectAirSimClient(
         address=args.server_ip,
@@ -314,7 +331,13 @@ async def main(args):
         drone = Drone(client, world, args.drone_name)
 
         if not args.no_display and any(mode in RGB_CAMERA_SENSORS or mode == "depth" for mode in modes):
-            preview = OpenCvPreview(args.preview_width, args.preview_height)
+            preview = OpenCvPreview(
+                args.preview_width,
+                args.preview_height,
+                args.depth_min_m,
+                args.depth_max_m,
+                args.depth_invert,
+            )
 
         if not args.no_display and "lidar" in modes:
             from projectairsim.lidar_utils import LidarDisplay
@@ -414,6 +437,25 @@ def build_parser() -> argparse.ArgumentParser:
         default="FrontCamera",
         help="Depth camera sensor to validate. Use DownCamera for the old downward view.",
     )
+    parser.add_argument(
+        "--depth-min-m",
+        type=float,
+        default=0.1,
+        help="Nearest depth value mapped into the preview color range.",
+    )
+    parser.add_argument(
+        "--depth-max-m",
+        type=float,
+        default=15.0,
+        help="Farthest depth value mapped into the preview color range.",
+    )
+    parser.add_argument(
+        "--no-depth-invert",
+        dest="depth_invert",
+        action="store_false",
+        help="Map near depth to cool colors and far depth to warm colors.",
+    )
+    parser.set_defaults(depth_invert=True)
     parser.add_argument("--lidar-sensor", default="lidar1")
     parser.add_argument("--preview-width", type=int, default=800)
     parser.add_argument("--preview-height", type=int, default=450)
