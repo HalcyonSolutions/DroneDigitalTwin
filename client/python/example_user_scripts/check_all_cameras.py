@@ -272,6 +272,13 @@ async def run_flight_pattern(drone: Drone, velocity_mps: float):
         ("north", velocity_mps, 0.0, 0.0, 4.0),
         ("east", 0.0, velocity_mps, 0.0, 4.0),
         ("west", 0.0, -velocity_mps, 0.0, 4.0),
+        ("west", 0.0, -velocity_mps, 0.0, 4.0),
+        ("west", 0.0, -velocity_mps, 0.0, 4.0),
+        ("north", velocity_mps, 0.0, 0.0, 4.0),
+        ("north", velocity_mps, 0.0, 0.0, 4.0),
+        ("north", velocity_mps, 0.0, 0.0, 4.0),
+        ("north", velocity_mps, 0.0, 0.0, 4.0),
+        ("north", velocity_mps, 0.0, 0.0, 4.0),
         ("down", 0.0, 0.0, velocity_mps, 3.0),
     ]
     try:
