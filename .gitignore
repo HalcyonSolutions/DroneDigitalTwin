@@ -387,6 +387,9 @@ test.exe
 text.obj
 DroneSimDev_ENV/
 
+# Environment/Map
+unreal/LowPolyRiverForest/
+
 # MISC
 test.cpp
 astar_map_view.png
