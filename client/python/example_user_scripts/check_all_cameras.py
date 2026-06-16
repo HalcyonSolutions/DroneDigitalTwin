@@ -10,7 +10,7 @@ Examples:
     python check_all_cameras.py --camera depth
     python check_all_cameras.py --camera lidar
     python check_all_cameras.py --camera all --fly-pattern
-    python check_all_cameras.py --camera depth --fly-pattern --avoid-obstacles
+    python check_all_cameras.py --camera depth --fly-pattern --avoid-obstacles --teleport-start --start 50,0,-10
 """
 
 import argparse
@@ -19,7 +19,7 @@ import queue
 import time
 from dataclasses import dataclass
 from threading import Thread
-from typing import Dict, Iterable, Optional
+from typing import Dict, Iterable, Optional, Sequence
 
 import numpy as np
 
@@ -227,6 +227,32 @@ def selected_modes(camera: str) -> Iterable[str]:
     return (camera,)
 
 
+def parse_vector3(value: str) -> Sequence[float]:
+    parts = value.replace(",", " ").split()
+    if len(parts) != 3:
+        raise argparse.ArgumentTypeError(
+            f"Expected three coordinates, got {len(parts)} from '{value}'"
+        )
+    try:
+        return [float(part) for part in parts]
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(f"Coordinates must be numeric: '{value}'") from exc
+
+
+def make_pose_ned(position_ned: Sequence[float]):
+    from projectairsim.types import Pose, Quaternion, Vector3
+
+    return Pose(
+        {
+            "translation": Vector3(
+                {"x": position_ned[0], "y": position_ned[1], "z": position_ned[2]}
+            ),
+            "rotation": Quaternion({"w": 1.0, "x": 0.0, "y": 0.0, "z": 0.0}),
+            "frame_id": "DEFAULT_ID",
+        }
+    )
+
+
 def summarize_image(image) -> str:
     encoding = image.get("encoding", "unknown")
     width = image.get("width", "?")
@@ -400,6 +426,13 @@ async def main(args):
         )
         drone = Drone(client, world, args.drone_name)
 
+        if args.teleport_start:
+            if args.start is None:
+                raise ValueError("--teleport-start requires --start north,east,down coordinates")
+            projectairsim_log().info(f"Teleporting '{args.drone_name}' to {args.start}")
+            drone.set_pose(make_pose_ned(args.start), reset_kinematics=True)
+            await asyncio.sleep(args.after_teleport_delay_sec)
+
         if not args.no_display and any(mode in RGB_CAMERA_SENSORS or mode == "depth" for mode in modes):
             preview = OpenCvPreview(
                 args.preview_width,
@@ -547,6 +580,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--preview-width", type=int, default=800)
     parser.add_argument("--preview-height", type=int, default=450)
     parser.add_argument("--no-display", action="store_true")
+    parser.add_argument("--teleport-start", action="store_true")
+    parser.add_argument(
+        "--start",
+        type=parse_vector3,
+        default=None,
+        help="Starting NED coordinates (north,east,down) to teleport the drone to",
+    )
+    parser.add_argument("--after-teleport-delay-sec", type=float, default=2.0)
     parser.add_argument("--fly-pattern", action="store_true")
     parser.add_argument("--velocity-mps", type=float, default=2.0)
     parser.add_argument(
