@@ -2,7 +2,7 @@
 Visualize Project AirSim NED coordinates for PX4 waypoint selection.
 
 This helper loads a scene, samples a voxel grid, saves a top-down occupancy
-slice, and optionally draws persistent debug markers in Unreal.
+map, and optionally draws persistent debug markers in Unreal.
 
 python px4_map_viewer.py `
    --start "30,0,-6" `
@@ -68,6 +68,21 @@ def infer_map_center(start: Sequence[float], goal: Sequence[float]) -> List[floa
     return [(start[idx] + goal[idx]) / 2.0 for idx in range(3)]
 
 
+def infer_vertical_map_center(
+    start: Sequence[float],
+    goal: Sequence[float],
+    slice_z_ned: float,
+    ground_z_ned: float,
+    map_height_m: float,
+) -> float:
+    z_values = [start[2], goal[2], slice_z_ned, ground_z_ned]
+    z_min = min(z_values)
+    z_max = max(z_values)
+    if z_max - z_min <= map_height_m:
+        return (z_min + z_max) / 2.0
+    return (start[2] + goal[2]) / 2.0
+
+
 def infer_map_size(
     start: Sequence[float],
     goal: Sequence[float],
@@ -118,12 +133,48 @@ def sample_occupancy_slice(
     return occupancy
 
 
+def sample_occupancy_projection(
+    planner: AStarPlanner,
+    map_center: Sequence[float],
+    map_size: Sequence[int],
+    resolution_m: float,
+):
+    x_cells = int(map_size[0] / resolution_m)
+    y_cells = int(map_size[1] / resolution_m)
+    z_cells = int(map_size[2] / resolution_m)
+    x_min = map_center[0] - map_size[0] / 2.0
+    y_min = map_center[1] - map_size[1] / 2.0
+    z_min = map_center[2] - map_size[2] / 2.0
+
+    occupancy = []
+    for y_idx in range(y_cells):
+        row = []
+        y = y_min + y_idx * resolution_m
+        for x_idx in range(x_cells):
+            x = x_min + x_idx * resolution_m
+            occupied = False
+            for z_idx in range(z_cells):
+                z = z_min + z_idx * resolution_m
+                try:
+                    idx = planner.get_grid_idx([x, y, z], is_NED=True)
+                    if bool(planner.occupancy_map[idx]):
+                        occupied = True
+                        break
+                except Exception:
+                    occupied = True
+                    break
+            row.append(occupied)
+        occupancy.append(row)
+
+    return occupancy
+
+
 def save_top_down_map(
     occupancy,
     output_path: Path,
     map_center: Sequence[float],
     map_size: Sequence[int],
-    slice_z_ned: float,
+    title: str,
     start: Sequence[float] = None,
     goal: Sequence[float] = None,
     path: List[List[float]] = None,
@@ -148,7 +199,7 @@ def save_top_down_map(
         interpolation="nearest",
         alpha=0.85,
     )
-    ax.set_title(f"Project AirSim occupancy slice, NED z={slice_z_ned:g} m")
+    ax.set_title(title)
     ax.set_xlabel("NED x / north (m)")
     ax.set_ylabel("NED y / east (m)")
     ax.grid(True, color="0.75", linewidth=0.5)
@@ -295,6 +346,14 @@ async def main(args):
                 args.map_margin_m,
                 args.min_map_size_m,
             )
+            if args.map_center is None:
+                map_center[2] = infer_vertical_map_center(
+                    args.start,
+                    args.goal,
+                    args.slice_z_ned,
+                    args.ground_z_ned,
+                    map_size[2],
+                )
         else:
             map_center = map_center or [0.0, 0.0, args.slice_z_ned]
             map_size = map_size or [100, 100, 40]
@@ -383,20 +442,35 @@ async def main(args):
             projectairsim_log().info("Unreal debug markers plotted")
 
         if args.output:
-            occupancy = sample_occupancy_slice(
-                planner,
-                map_center,
-                map_size,
-                args.resolution_m,
-                args.slice_z_ned,
-            )
+            if args.render_mode == "slice":
+                occupancy = sample_occupancy_slice(
+                    planner,
+                    map_center,
+                    map_size,
+                    args.resolution_m,
+                    args.slice_z_ned,
+                )
+                title = f"Project AirSim occupancy slice, NED z={args.slice_z_ned:g} m"
+            else:
+                occupancy = sample_occupancy_projection(
+                    planner,
+                    map_center,
+                    map_size,
+                    args.resolution_m,
+                )
+                z_min = map_center[2] - map_size[2] / 2.0
+                z_max = map_center[2] + map_size[2] / 2.0
+                title = (
+                    "Project AirSim occupancy projection, "
+                    f"NED z=[{z_min:g}, {z_max:g}] m"
+                )
             output_path = Path(args.output)
             save_top_down_map(
                 occupancy,
                 output_path,
                 map_center,
                 map_size,
-                args.slice_z_ned,
+                title,
                 args.start,
                 args.goal,
                 path,
@@ -426,6 +500,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--map-margin-m", type=float, default=20.0)
     parser.add_argument("--min-map-size-m", type=float, default=50.0)
     parser.add_argument("--resolution-m", type=float, default=1.0)
+    parser.add_argument(
+        "--render-mode",
+        choices=("projection", "slice"),
+        default="projection",
+        help=(
+            "projection marks a top-down cell occupied if any voxel in its "
+            "vertical column is occupied; slice only samples --slice-z-ned."
+        ),
+    )
     parser.add_argument("--slice-z-ned", type=float, default=-8.0)
     parser.add_argument("--ground-z-ned", type=float, default=0.0)
     parser.add_argument("--grid-step-m", type=float, default=10.0)
