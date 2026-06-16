@@ -12,6 +12,7 @@ python px4_map_viewer.py `
    --grid-step-m 10 `
    --label-step-m 20 `
    --output astar_map_view.png `
+   --output-3d astar_map_view_3d.png `
    --map-size "120,120,40"
 """
 
@@ -169,6 +170,45 @@ def sample_occupancy_projection(
     return occupancy
 
 
+def occupied_voxel_points(
+    occupancy_grid,
+    map_center: Sequence[float],
+    map_size: Sequence[int],
+    resolution_m: float,
+    max_points: int,
+):
+    x_cells = int(map_size[0] / resolution_m)
+    y_cells = int(map_size[1] / resolution_m)
+    z_cells = int(map_size[2] / resolution_m)
+    occupied_count = sum(1 for occupied in occupancy_grid if occupied)
+    if occupied_count == 0:
+        return [], 0, 1
+
+    stride = max(1, math.ceil(occupied_count / max_points)) if max_points > 0 else 1
+    points = []
+    seen = 0
+    x_origin = map_center[0] - (x_cells / 2.0) * resolution_m
+    y_origin = map_center[1] - (y_cells / 2.0) * resolution_m
+    neu_z_origin = -map_center[2] - (z_cells / 2.0) * resolution_m
+
+    for y_idx in range(y_cells):
+        for z_idx in range(z_cells):
+            for x_idx in range(x_cells):
+                idx = x_idx + x_cells * (z_idx + z_cells * y_idx)
+                if not occupancy_grid[idx]:
+                    continue
+                seen += 1
+                if (seen - 1) % stride != 0:
+                    continue
+
+                x = x_origin + x_idx * resolution_m
+                y = y_origin + y_idx * resolution_m
+                z_ned = -(neu_z_origin + z_idx * resolution_m)
+                points.append((x, y, z_ned))
+
+    return points, occupied_count, stride
+
+
 def save_top_down_map(
     occupancy,
     output_path: Path,
@@ -217,6 +257,111 @@ def save_top_down_map(
         ax.legend(loc="upper right")
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=150)
+    plt.close(fig)
+
+
+def save_3d_map(
+    occupancy_grid,
+    output_path: Path,
+    map_center: Sequence[float],
+    map_size: Sequence[int],
+    resolution_m: float,
+    start: Sequence[float] = None,
+    goal: Sequence[float] = None,
+    path: List[List[float]] = None,
+    max_points: int = 100000,
+    elev: float = 25.0,
+    azim: float = -55.0,
+):
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    points, occupied_count, stride = occupied_voxel_points(
+        occupancy_grid,
+        map_center,
+        map_size,
+        resolution_m,
+        max_points,
+    )
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    fig = plt.figure(figsize=(12, 9))
+    ax = fig.add_subplot(111, projection="3d")
+
+    x_min = map_center[0] - map_size[0] / 2.0
+    x_max = map_center[0] + map_size[0] / 2.0
+    y_min = map_center[1] - map_size[1] / 2.0
+    y_max = map_center[1] + map_size[1] / 2.0
+    z_min = map_center[2] - map_size[2] / 2.0
+    z_max = map_center[2] + map_size[2] / 2.0
+
+    if points:
+        xs, ys, zs = zip(*points)
+        ax.scatter(
+            xs,
+            ys,
+            zs,
+            c=zs,
+            cmap="viridis",
+            marker="s",
+            s=3,
+            alpha=0.55,
+            linewidths=0,
+        )
+
+    if path:
+        ax.plot(
+            [p[0] for p in path],
+            [p[1] for p in path],
+            [p[2] for p in path],
+            color="limegreen",
+            linewidth=2,
+            label="path",
+        )
+    if start:
+        ax.scatter(
+            [start[0]],
+            [start[1]],
+            [start[2]],
+            marker="o",
+            s=80,
+            color="dodgerblue",
+            label="start",
+        )
+    if goal:
+        ax.scatter(
+            [goal[0]],
+            [goal[1]],
+            [goal[2]],
+            marker="x",
+            s=100,
+            color="crimson",
+            label="goal",
+        )
+    if start or goal or path:
+        ax.legend(loc="upper right")
+
+    ax.set_title(
+        "Project AirSim 3D occupancy "
+        f"({len(points):,}/{occupied_count:,} occupied voxels shown, stride={stride})"
+    )
+    ax.set_xlabel("NED x / north (m)")
+    ax.set_ylabel("NED y / east (m)")
+    ax.set_zlabel("NED z / down (m)")
+    ax.set_xlim(x_min, x_max)
+    ax.set_ylim(y_min, y_max)
+    ax.set_zlim(z_min, z_max)
+    ax.view_init(elev=elev, azim=azim)
+    try:
+        ax.set_box_aspect((map_size[0], map_size[1], map_size[2]))
+    except AttributeError:
+        pass
+    ax.grid(True, color="0.8")
+
     fig.tight_layout()
     fig.savefig(output_path, dpi=150)
     plt.close(fig)
@@ -477,6 +622,23 @@ async def main(args):
             )
             projectairsim_log().info("Top-down map written to %s", output_path)
 
+        if args.output_3d:
+            output_3d_path = Path(args.output_3d)
+            save_3d_map(
+                occupancy_grid,
+                output_3d_path,
+                map_center,
+                map_size,
+                args.resolution_m,
+                args.start,
+                args.goal,
+                path,
+                args.max_3d_points,
+                args.view_elev,
+                args.view_azim,
+            )
+            projectairsim_log().info("3D occupancy map written to %s", output_3d_path)
+
     finally:
         if client.state:
             client.disconnect()
@@ -515,6 +677,19 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--label-step-m", type=float, default=20.0)
     parser.add_argument("--duration-sec", type=float, default=120.0)
     parser.add_argument("--output", default="astar_map_view.png")
+    parser.add_argument(
+        "--output-3d",
+        default=None,
+        help="Optional path for a 3D occupancy PNG covering the full voxel grid.",
+    )
+    parser.add_argument(
+        "--max-3d-points",
+        type=int,
+        default=100000,
+        help="Maximum occupied voxels to draw in the 3D PNG before downsampling.",
+    )
+    parser.add_argument("--view-elev", type=float, default=25.0)
+    parser.add_argument("--view-azim", type=float, default=-55.0)
     parser.add_argument("--no-unreal-markers", action="store_true")
     parser.add_argument("--keep-existing-markers", action="store_true")
     parser.add_argument("--clear-only", action="store_true")
