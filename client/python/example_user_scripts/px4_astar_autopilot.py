@@ -8,11 +8,12 @@ that path through Project AirSim's PX4 offboard movement API.
 
 import argparse
 import asyncio
+import commentjson
 import math
 import time
 import sys
 from pathlib import Path
-from typing import List, Sequence
+from typing import List, Sequence, Tuple
 
 from projectairsim import Drone, ProjectAirSimClient, World
 from projectairsim.drone import YawControlMode
@@ -73,6 +74,62 @@ def make_pose_ned(position_ned: Sequence[float]) -> Pose:
     )
 
 
+def format_scene_origin_xyz(position_ned: Sequence[float]) -> str:
+    return " ".join(f"{component:g}" for component in position_ned)
+
+
+def resolve_scene_config_path(scene: str, sim_config_path: str) -> Path:
+    scene_path = Path(scene)
+    if scene_path.is_absolute():
+        return scene_path
+
+    config_dir = Path(sim_config_path)
+    cwd_candidate = config_dir / scene_path
+    if cwd_candidate.exists():
+        return cwd_candidate
+
+    script_candidate = Path(__file__).resolve().parent / config_dir / scene_path
+    if script_candidate.exists():
+        return script_candidate
+
+    return cwd_candidate
+
+
+def create_start_origin_scene_config(
+    scene: str,
+    sim_config_path: str,
+    drone_name: str,
+    start: Sequence[float],
+) -> Tuple[str, str, Path]:
+    source_path = resolve_scene_config_path(scene, sim_config_path)
+    if not source_path.exists():
+        raise FileNotFoundError(f"Scene config not found: {source_path}")
+
+    scene_config = commentjson.loads(source_path.read_text(encoding="utf-8"))
+    target_actor = None
+    for actor in scene_config.get("actors", []):
+        if actor.get("type") == "robot" and actor.get("name") == drone_name:
+            target_actor = actor
+            break
+
+    if target_actor is None:
+        raise RuntimeError(
+            f"Could not find robot actor '{drone_name}' in {source_path}"
+        )
+
+    origin = target_actor.setdefault("origin", {})
+    origin["xyz"] = format_scene_origin_xyz(start)
+
+    output_name = f"{source_path.stem}_runtime_start{source_path.suffix or '.jsonc'}"
+    output_path = source_path.with_name(output_name)
+    output_path.write_text(
+        commentjson.dumps(scene_config, indent=2) + "\n",
+        encoding="utf-8",
+    )
+
+    return output_path.name, str(output_path.parent), output_path
+
+
 def infer_map_center(start: Sequence[float], goal: Sequence[float]) -> List[float]:
     return [(start[idx] + goal[idx]) / 2.0 for idx in range(3)]
 
@@ -113,6 +170,67 @@ def validate_grid_coordinate(planner: AStarPlanner, point: Sequence[float], name
 
 def distance_between(a: Sequence[float], b: Sequence[float]) -> float:
     return math.sqrt(sum((a[idx] - b[idx]) ** 2 for idx in range(3)))
+
+
+async def teleport_and_verify(
+    drone: Drone,
+    target: Sequence[float],
+    delay_sec: float,
+    live_ned=None,
+    flight_trace=None,
+    label: str = "Teleport start",
+    tolerance_m: float = 2.0,
+    attempts: int = 3,
+    strict: bool = False,
+):
+    attempts = max(1, attempts)
+    actual = None
+    error = math.inf
+
+    for attempt in range(1, attempts + 1):
+        projectairsim_log().info(
+            "Teleporting to %s, attempt %d/%d",
+            target,
+            attempt,
+            attempts,
+        )
+        drone.set_pose(make_pose_ned(target), reset_kinematics=True)
+        await asyncio.sleep(delay_sec)
+
+        actual = get_pose_position_ned(drone)
+        error = distance_between(actual, target)
+        if flight_trace:
+            flight_trace.record(label, actual, force=True)
+        if live_ned:
+            live_ned.show(label, actual, target=target, remaining_m=error, force=True)
+
+        if error <= tolerance_m:
+            projectairsim_log().info(
+                "Teleport verified: requested=%s actual=%s error=%.2fm",
+                target,
+                actual,
+                error,
+            )
+            return actual
+
+        projectairsim_log().info(
+            "Teleport not settled yet: requested=%s actual=%s error=%.2fm",
+            target,
+            actual,
+            error,
+        )
+
+    message = (
+        f"Teleport did not reach requested NED within {tolerance_m:.2f}m: "
+        f"requested={target}, actual={actual}, error={error:.2f}m. "
+        "If only z differs, the vehicle may be colliding with terrain or takeoff "
+        "logic may be changing altitude."
+    )
+    if strict:
+        raise RuntimeError(message)
+
+    projectairsim_log().info("WARNING: %s", message)
+    return actual
 
 
 def format_vector3(values: Sequence[float]) -> str:
@@ -579,6 +697,27 @@ async def run_px4_keyboard_control(
 
 
 async def run_autopilot(args):
+    scene = args.scene
+    sim_config_path = args.sim_config_path
+    start_as_scene_origin = False
+    if args.start_as_scene_origin:
+        if args.start is None:
+            raise RuntimeError("--start-as-scene-origin requires --start")
+
+        scene, sim_config_path, generated_scene_path = create_start_origin_scene_config(
+            args.scene,
+            args.sim_config_path,
+            args.drone_name,
+            args.start,
+        )
+        start_as_scene_origin = True
+        projectairsim_log().info(
+            "Generated PX4 start scene %s with %s origin xyz=%s",
+            generated_scene_path,
+            args.drone_name,
+            format_scene_origin_xyz(args.start),
+        )
+
     client = ProjectAirSimClient(
         address=args.server_ip,
         port_topics=args.topics_port,
@@ -602,10 +741,18 @@ async def run_autopilot(args):
 
         world = World(
             client,
-            args.scene,
+            scene,
             delay_after_load_sec=args.load_delay_sec,
-            sim_config_path=args.sim_config_path,
+            sim_config_path=sim_config_path,
         )
+        if start_as_scene_origin:
+            projectairsim_log().info(
+                "Loaded %s with %s spawned at --start. If PX4 was already "
+                "running before this scene loaded, restart PX4 now and let "
+                "this script keep waiting for the vehicle.",
+                scene,
+                args.drone_name,
+            )
         drone = Drone(client, world, args.drone_name)
 
         if args.show_chase_camera:
@@ -640,20 +787,30 @@ async def run_autopilot(args):
 
         start = args.start
         goal = args.goal
+        runtime_teleport_start = args.teleport_start and not start_as_scene_origin
+        if args.teleport_start and start_as_scene_origin:
+            projectairsim_log().info(
+                "Ignoring --teleport-start because --start-as-scene-origin "
+                "already placed the actor at --start before PX4 connects."
+            )
 
         if args.keyboard_control:
-            if args.teleport_start:
+            await wait_for_px4_ready(drone, args.px4_ready_timeout_sec)
+
+            if runtime_teleport_start:
                 if not start:
                     raise RuntimeError("--teleport-start requires --start in keyboard mode")
-                projectairsim_log().info(f"Teleporting '{args.drone_name}' to {start}")
-                drone.set_pose(make_pose_ned(start), reset_kinematics=True)
-                await asyncio.sleep(args.after_teleport_delay_sec)
-                position = get_pose_position_ned(drone)
-                if flight_trace:
-                    flight_trace.record("Teleport start", position, force=True)
-                live_ned.show("Teleport start", position, force=True)
+                await teleport_and_verify(
+                    drone,
+                    start,
+                    args.after_teleport_delay_sec,
+                    live_ned,
+                    flight_trace,
+                    tolerance_m=args.teleport_tolerance_m,
+                    attempts=args.teleport_attempts,
+                    strict=args.strict_teleport,
+                )
 
-            await wait_for_px4_ready(drone, args.px4_ready_timeout_sec)
             before_arming_pose = log_pose(drone, "Before arming")
             if flight_trace:
                 flight_trace.record("Before arming", before_arming_pose, force=True)
@@ -706,14 +863,6 @@ async def run_autopilot(args):
             start, goal, args.map_margin_m, args.min_map_size_m
         )
 
-        if args.teleport_start:
-            projectairsim_log().info(f"Teleporting '{args.drone_name}' to {start}")
-            drone.set_pose(make_pose_ned(start), reset_kinematics=True)
-            await asyncio.sleep(args.after_teleport_delay_sec)
-            if flight_trace:
-                flight_trace.record("Teleport start", get_pose_position_ned(drone), force=True)
-            live_ned.show("Teleport start", get_pose_position_ned(drone), force=True)
-
         actors_to_ignore = args.ignore_actor or [args.drone_name]
 
         projectairsim_log().info(
@@ -760,6 +909,17 @@ async def run_autopilot(args):
                 projectairsim_log().info(f"Waypoint {idx:03d}: {point}")
 
         await wait_for_px4_ready(drone, args.px4_ready_timeout_sec)
+        if runtime_teleport_start:
+            await teleport_and_verify(
+                drone,
+                start,
+                args.after_teleport_delay_sec,
+                live_ned,
+                flight_trace,
+                tolerance_m=args.teleport_tolerance_m,
+                attempts=args.teleport_attempts,
+                strict=args.strict_teleport,
+            )
         before_arming_pose = log_pose(drone, "Before arming")
         if flight_trace:
             flight_trace.record("Before arming", before_arming_pose, force=True)
@@ -787,7 +947,7 @@ async def run_autopilot(args):
                 flight_trace.record("Skipping takeoff", skipping_takeoff_pose, force=True)
             live_ned.show("Skipping takeoff", skipping_takeoff_pose, force=True)
 
-        if not args.teleport_start:
+        if not runtime_teleport_start:
             if args.flight_driver == "velocity":
                 projectairsim_log().info(f"Velocity-driving to start point {start}")
                 await fly_to_point_by_velocity(
@@ -949,6 +1109,15 @@ def build_parser() -> argparse.ArgumentParser:
         default=0.1,
         help="Duration of each keyboard velocity/yaw command.",
     )
+    parser.add_argument(
+        "--start-as-scene-origin",
+        action="store_true",
+        help=(
+            "Generate and load a runtime scene config with the drone actor "
+            "origin set to --start. This is the preferred PX4 start workflow; "
+            "it avoids runtime set_pose teleporting after PX4 connects."
+        ),
+    )
     parser.add_argument("--resolution-m", type=float, default=1.0)
     parser.add_argument("--map-center", type=parse_vector3)
     parser.add_argument("--map-size", type=parse_size3)
@@ -987,6 +1156,23 @@ def build_parser() -> argparse.ArgumentParser:
         help="Path API timeout. Use 0 to infer from path length and velocity.",
     )
     parser.add_argument("--pose-report-interval-sec", type=float, default=2.0)
+    parser.add_argument(
+        "--teleport-tolerance-m",
+        type=float,
+        default=2.0,
+        help="Allowed distance between requested and actual NED after teleport.",
+    )
+    parser.add_argument(
+        "--teleport-attempts",
+        type=int,
+        default=3,
+        help="Number of times to retry teleport before warning or failing.",
+    )
+    parser.add_argument(
+        "--strict-teleport",
+        action="store_true",
+        help="Fail if actual NED is not within --teleport-tolerance-m after teleport.",
+    )
     parser.add_argument(
         "--live-ned-interval-sec",
         type=float,
