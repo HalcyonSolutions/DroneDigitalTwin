@@ -20,6 +20,8 @@ from projectairsim.planners import AStarPlanner
 from projectairsim.types import Pose, Quaternion, Vector3
 from projectairsim.utils import calculate_path_length, projectairsim_log
 
+keyboard = None
+
 
 def parse_vector3(value: str) -> List[float]:
     parts = value.replace(",", " ").split()
@@ -126,6 +128,23 @@ def log_pose(drone: Drone, label: str) -> List[float]:
     position = get_pose_position_ned(drone)
     projectairsim_log().info(f"{label} pose NED {format_vector3(position)}")
     return position
+
+
+def load_keyboard_module():
+    global keyboard
+    if keyboard is not None:
+        return keyboard
+
+    try:
+        import keyboard as keyboard_module
+    except ModuleNotFoundError as exc:
+        raise RuntimeError(
+            "Keyboard control mode needs the 'keyboard' Python package. "
+            "Install it in DroneSimDev_ENV with: pip install keyboard"
+        ) from exc
+
+    keyboard = keyboard_module
+    return keyboard
 
 
 class FlightTrace:
@@ -469,6 +488,96 @@ async def fly_path_by_velocity(
         )
 
 
+async def run_px4_keyboard_control(
+    drone: Drone,
+    velocity_mps: float,
+    yaw_rate_dps: float,
+    command_duration_sec: float,
+    live_ned: LiveNedDisplay,
+    flight_trace: FlightTrace = None,
+):
+    keyboard_module = load_keyboard_module()
+    await request_px4_control(drone)
+
+    print("\n--- PX4 Keyboard Control ---")
+    print("W/S: forward/backward")
+    print("A/D: left/right")
+    print("Up/Down Arrows: up/down altitude")
+    print("Left/Right Arrows: yaw left/right")
+    print("L: land and exit")
+    print("Q: quit without landing")
+    print("----------------------------")
+
+    while True:
+        current = get_pose_position_ned(drone)
+        if flight_trace:
+            flight_trace.record("Keyboard control", current)
+        if live_ned:
+            live_ned.show("Keyboard control", current)
+
+        vx, vy, vz, yaw_rate = 0.0, 0.0, 0.0, 0.0
+
+        if keyboard_module.is_pressed("w"):
+            vx = velocity_mps
+        elif keyboard_module.is_pressed("s"):
+            vx = -velocity_mps
+
+        if keyboard_module.is_pressed("a"):
+            vy = -velocity_mps
+        elif keyboard_module.is_pressed("d"):
+            vy = velocity_mps
+
+        if keyboard_module.is_pressed("up"):
+            vz = -velocity_mps
+        elif keyboard_module.is_pressed("down"):
+            vz = velocity_mps
+
+        if keyboard_module.is_pressed("left"):
+            yaw_rate = -yaw_rate_dps
+        elif keyboard_module.is_pressed("right"):
+            yaw_rate = yaw_rate_dps
+
+        if keyboard_module.is_pressed("l"):
+            projectairsim_log().info("Keyboard requested landing")
+            land_task = await drone.land_async()
+            await await_drone_task(
+                drone,
+                land_task,
+                "Keyboard landing",
+                30.0,
+                1.0,
+                flight_trace,
+                live_ned,
+            )
+            return
+
+        if keyboard_module.is_pressed("q"):
+            projectairsim_log().info("Keyboard requested quit")
+            return
+
+        if vx != 0.0 or vy != 0.0 or vz != 0.0:
+            move_task = await drone.move_by_velocity_body_frame_async(
+                vx,
+                vy,
+                vz,
+                command_duration_sec,
+            )
+            result = await move_task
+            if result is False:
+                raise RuntimeError("Keyboard velocity command returned False")
+
+        if yaw_rate != 0.0:
+            yaw_task = await drone.rotate_by_yaw_rate_async(
+                yaw_rate,
+                command_duration_sec,
+            )
+            result = await yaw_task
+            if result is False:
+                raise RuntimeError("Keyboard yaw command returned False")
+
+        await asyncio.sleep(0.02)
+
+
 async def run_autopilot(args):
     client = ProjectAirSimClient(
         address=args.server_ip,
@@ -531,6 +640,67 @@ async def run_autopilot(args):
 
         start = args.start
         goal = args.goal
+
+        if args.keyboard_control:
+            if args.teleport_start:
+                if not start:
+                    raise RuntimeError("--teleport-start requires --start in keyboard mode")
+                projectairsim_log().info(f"Teleporting '{args.drone_name}' to {start}")
+                drone.set_pose(make_pose_ned(start), reset_kinematics=True)
+                await asyncio.sleep(args.after_teleport_delay_sec)
+                position = get_pose_position_ned(drone)
+                if flight_trace:
+                    flight_trace.record("Teleport start", position, force=True)
+                live_ned.show("Teleport start", position, force=True)
+
+            await wait_for_px4_ready(drone, args.px4_ready_timeout_sec)
+            before_arming_pose = log_pose(drone, "Before arming")
+            if flight_trace:
+                flight_trace.record("Before arming", before_arming_pose, force=True)
+            live_ned.show("Before arming", before_arming_pose, force=True)
+
+            if not drone.enable_api_control():
+                raise RuntimeError("Project AirSim did not enable API control")
+            await arm_with_retry(drone, args.arm_timeout_sec)
+
+            if not args.skip_takeoff:
+                projectairsim_log().info("Taking off")
+                takeoff_task = await drone.takeoff_async(
+                    timeout_sec=args.takeoff_timeout_sec
+                )
+                await await_drone_task(
+                    drone,
+                    takeoff_task,
+                    "Takeoff",
+                    args.takeoff_timeout_sec + 5.0,
+                    args.pose_report_interval_sec,
+                    flight_trace,
+                    live_ned,
+                )
+            else:
+                skipping_takeoff_pose = log_pose(drone, "Skipping takeoff")
+                if flight_trace:
+                    flight_trace.record(
+                        "Skipping takeoff",
+                        skipping_takeoff_pose,
+                        force=True,
+                    )
+                live_ned.show("Skipping takeoff", skipping_takeoff_pose, force=True)
+
+            await run_px4_keyboard_control(
+                drone,
+                args.keyboard_speed_mps,
+                args.keyboard_yaw_rate_dps,
+                args.keyboard_command_duration_sec,
+                live_ned,
+                flight_trace,
+            )
+
+            if not args.keep_armed:
+                drone.disarm()
+                drone.disable_api_control()
+            return
+
         map_center = args.map_center or infer_map_center(start, goal)
         map_size = args.map_size or infer_map_size(
             start, goal, args.map_margin_m, args.min_map_size_m
@@ -742,8 +912,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Plan an A* path and fly it with the PX4-backed drone API."
     )
-    parser.add_argument("--start", type=parse_vector3, required=True, help="NED x,y,z")
-    parser.add_argument("--goal", type=parse_vector3, required=True, help="NED x,y,z")
+    parser.add_argument("--start", type=parse_vector3, help="NED x,y,z")
+    parser.add_argument("--goal", type=parse_vector3, help="NED x,y,z")
     parser.add_argument(
         "--scene",
         default="scene_px4_sitl.jsonc",
@@ -756,6 +926,29 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--services-port", type=int, default=8990)
     parser.add_argument("--load-delay-sec", type=float, default=2.0)
     parser.add_argument("--velocity-mps", type=float, default=4.0)
+    parser.add_argument(
+        "--keyboard-control",
+        action="store_true",
+        help="Use PX4 keyboard/manual control mode instead of A* planning.",
+    )
+    parser.add_argument(
+        "--keyboard-speed-mps",
+        type=float,
+        default=4.0,
+        help="Body-frame speed used by --keyboard-control.",
+    )
+    parser.add_argument(
+        "--keyboard-yaw-rate-dps",
+        type=float,
+        default=30.0,
+        help="Yaw rate in degrees/s used by --keyboard-control.",
+    )
+    parser.add_argument(
+        "--keyboard-command-duration-sec",
+        type=float,
+        default=0.1,
+        help="Duration of each keyboard velocity/yaw command.",
+    )
     parser.add_argument("--resolution-m", type=float, default=1.0)
     parser.add_argument("--map-center", type=parse_vector3)
     parser.add_argument("--map-size", type=parse_size3)
@@ -839,4 +1032,9 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 if __name__ == "__main__":
-    asyncio.run(run_autopilot(build_parser().parse_args(normalize_vector_args(sys.argv[1:]))))
+    parser = build_parser()
+    parsed_args = parser.parse_args(normalize_vector_args(sys.argv[1:]))
+    if not parsed_args.keyboard_control:
+        if parsed_args.start is None or parsed_args.goal is None:
+            parser.error("--start and --goal are required unless --keyboard-control is used")
+    asyncio.run(run_autopilot(parsed_args))
