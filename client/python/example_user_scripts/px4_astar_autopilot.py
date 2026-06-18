@@ -699,6 +699,8 @@ async def run_px4_keyboard_control(
 async def run_autopilot(args):
     scene = args.scene
     sim_config_path = args.sim_config_path
+    drone = None
+    cleanup_needed = False
     start_as_scene_origin = False
     if args.start_as_scene_origin:
         if args.start is None:
@@ -818,6 +820,7 @@ async def run_autopilot(args):
 
             if not drone.enable_api_control():
                 raise RuntimeError("Project AirSim did not enable API control")
+            cleanup_needed = True
             await arm_with_retry(drone, args.arm_timeout_sec)
 
             if not args.skip_takeoff:
@@ -856,6 +859,7 @@ async def run_autopilot(args):
             if not args.keep_armed:
                 drone.disarm()
                 drone.disable_api_control()
+                cleanup_needed = False
             return
 
         map_center = args.map_center or infer_map_center(start, goal)
@@ -908,6 +912,12 @@ async def run_autopilot(args):
             for idx, point in enumerate(path):
                 projectairsim_log().info(f"Waypoint {idx:03d}: {point}")
 
+        if args.plan_only:
+            projectairsim_log().info(
+                "Plan-only mode requested; skipping PX4 readiness, arming, and flight"
+            )
+            return
+
         await wait_for_px4_ready(drone, args.px4_ready_timeout_sec)
         if runtime_teleport_start:
             await teleport_and_verify(
@@ -927,6 +937,7 @@ async def run_autopilot(args):
 
         if not drone.enable_api_control():
             raise RuntimeError("Project AirSim did not enable API control")
+        cleanup_needed = True
         await arm_with_retry(drone, args.arm_timeout_sec)
 
         if not args.skip_takeoff:
@@ -1052,8 +1063,20 @@ async def run_autopilot(args):
         if not args.keep_armed:
             drone.disarm()
             drone.disable_api_control()
+            cleanup_needed = False
 
     finally:
+        if cleanup_needed and drone is not None and not args.keep_armed:
+            try:
+                projectairsim_log().info("Cleaning up PX4 control before exit")
+                drone.cancel_last_task()
+                drone.disarm()
+                drone.disable_api_control()
+            except Exception as cleanup_error:
+                projectairsim_log().warning(
+                    "PX4 cleanup failed during script exit: %s",
+                    cleanup_error,
+                )
         if flight_trace and args.flight_trace_output:
             save_flight_trace_plot(
                 flight_trace,
@@ -1207,6 +1230,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--land-at-goal", action="store_true")
     parser.add_argument("--keep-armed", action="store_true")
     parser.add_argument("--print-waypoints", action="store_true")
+    parser.add_argument(
+        "--plan-only",
+        action="store_true",
+        help="Build the occupancy grid and A* path, then exit before PX4 arming/flight.",
+    )
     parser.add_argument(
         "--show-chase-camera",
         action="store_true",
