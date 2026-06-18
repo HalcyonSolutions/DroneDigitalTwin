@@ -3,10 +3,41 @@ import asyncio
 import time
 import projectairsim
 from projectairsim import Drone, World
+from projectairsim.types import Pose, Quaternion, Vector3
 
 keyboard = None
 
 # --- Drone Control Functions ---
+
+
+def parse_vector3(value):
+    parts = value.replace(",", " ").split()
+    if len(parts) != 3:
+        raise argparse.ArgumentTypeError(
+            f"Expected three coordinates, got {len(parts)} from '{value}'"
+        )
+    try:
+        return [float(part) for part in parts]
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(
+            f"Coordinates must be numeric: '{value}'"
+        ) from exc
+
+
+def make_pose_ned(position_ned):
+    return Pose(
+        {
+            "translation": Vector3(
+                {
+                    "x": position_ned[0],
+                    "y": position_ned[1],
+                    "z": position_ned[2],
+                }
+            ),
+            "rotation": Quaternion({"w": 1.0, "x": 0.0, "y": 0.0, "z": 0.0}),
+            "frame_id": "DEFAULT_ID",
+        }
+    )
 
 
 def get_pose_position_ned(drone):
@@ -224,6 +255,11 @@ async def main():
         help="Disable live NED position printing.",
         action="store_true",
     )
+    parser.add_argument(
+        "--start",
+        type=parse_vector3,
+        help="Optional NED x,y,z position to teleport Drone1 to before takeoff.",
+    )
 
     args = parser.parse_args()
     client = projectairsim.ProjectAirSimClient(
@@ -241,6 +277,18 @@ async def main():
             sim_config_path=args.simconfigpath,
         )
         drone = Drone(client, world, "Drone1")
+
+        if args.start:
+            print(f"Teleporting Drone1 to NED {args.start}...")
+            drone.set_pose(make_pose_ned(args.start), reset_kinematics=True)
+            time.sleep(1)
+            if not args.no_live_ned:
+                print_live_ned(
+                    drone,
+                    last_print_at=0.0,
+                    interval_sec=args.live_ned_interval_sec,
+                    force=True,
+                )
 
         await run_keyboard_control(
             drone,
