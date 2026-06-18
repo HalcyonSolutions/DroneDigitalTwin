@@ -3,9 +3,30 @@ import asyncio
 import time
 import projectairsim
 from projectairsim import Drone, World
-import keyboard
+
+keyboard = None
 
 # --- Drone Control Functions ---
+
+
+def get_pose_position_ned(drone):
+    position = drone.get_ground_truth_kinematics()["pose"]["position"]
+    return [float(position["x"]), float(position["y"]), float(position["z"])]
+
+
+def print_live_ned(drone, last_print_at, interval_sec, force=False):
+    now = time.time()
+    if not force and now - last_print_at < interval_sec:
+        return last_print_at
+
+    position = get_pose_position_ned(drone)
+    print(
+        f"[LIVE NED] x={position[0]:8.2f}  "
+        f"y={position[1]:8.2f}  z={position[2]:8.2f}",
+        flush=True,
+    )
+    return now
+
 
 async def takeoff(drone):
     """Arms the drone and takes off to a default altitude."""
@@ -25,13 +46,24 @@ async def land(drone):
 
 # --- Main Control Loop ---
 
-async def run_keyboard_control(drone):
+async def run_keyboard_control(drone, live_ned_interval_sec, show_live_ned=True):
     """
     Controls the drone using keyboard inputs.
 
     Args:
         drone: The Drone object.
     """
+
+    global keyboard
+    if keyboard is None:
+        try:
+            import keyboard as keyboard_module
+        except ModuleNotFoundError as exc:
+            raise RuntimeError(
+                "The keyboard_control.py script needs the 'keyboard' Python "
+                "package. Install it in DroneSimDev_ENV with: pip install keyboard"
+            ) from exc
+        keyboard = keyboard_module
 
     # Enable API control
     drone.enable_api_control()
@@ -51,11 +83,21 @@ async def run_keyboard_control(drone):
     print("Left/Right Arrows: Yaw (Rotation)")
     print("L: Land")
     print("Q: Quit")
+    if show_live_ned:
+        print(f"Live NED: printing every {live_ned_interval_sec:g}s")
     print("--------------------")
 
     keep_running = True
+    last_live_ned_at = 0.0
 
     while keep_running:
+        if show_live_ned:
+            last_live_ned_at = print_live_ned(
+                drone,
+                last_live_ned_at,
+                live_ned_interval_sec,
+            )
+
         # Reset velocity components
         vx, vy, vz, yaw_rate = 0, 0, 0, 0
 
@@ -90,10 +132,24 @@ async def run_keyboard_control(drone):
         # Land and exit
         if keyboard.is_pressed('l'):
             await land(drone)
+            if show_live_ned:
+                last_live_ned_at = print_live_ned(
+                    drone,
+                    last_live_ned_at,
+                    live_ned_interval_sec,
+                    force=True,
+                )
             keep_running = False
 
         # Quit
         if keyboard.is_pressed('q'):
+            if show_live_ned:
+                last_live_ned_at = print_live_ned(
+                    drone,
+                    last_live_ned_at,
+                    live_ned_interval_sec,
+                    force=True,
+                )
             keep_running = False
 
         # Move the drone in its body frame
@@ -157,6 +213,17 @@ async def main():
         type=int,
         default=8990,
     )
+    parser.add_argument(
+        "--live-ned-interval-sec",
+        help="How often to print live NED position while manually flying.",
+        type=float,
+        default=0.5,
+    )
+    parser.add_argument(
+        "--no-live-ned",
+        help="Disable live NED position printing.",
+        action="store_true",
+    )
 
     args = parser.parse_args()
     client = projectairsim.ProjectAirSimClient(
@@ -175,7 +242,11 @@ async def main():
         )
         drone = Drone(client, world, "Drone1")
 
-        await run_keyboard_control(drone)
+        await run_keyboard_control(
+            drone,
+            args.live_ned_interval_sec,
+            not args.no_live_ned,
+        )
 
     except Exception as e:
         print(f"An error occurred: {e}")
