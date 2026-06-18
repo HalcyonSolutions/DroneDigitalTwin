@@ -11,6 +11,7 @@ import asyncio
 import math
 import time
 import sys
+from pathlib import Path
 from typing import List, Sequence
 
 from projectairsim import Drone, ProjectAirSimClient, World
@@ -127,6 +128,91 @@ def log_pose(drone: Drone, label: str) -> List[float]:
     return position
 
 
+class FlightTrace:
+    def __init__(self, sample_interval_sec: float):
+        self.sample_interval_sec = max(0.0, sample_interval_sec)
+        self.started_at = time.time()
+        self.last_sample_at = 0.0
+        self.samples = []
+
+    def record(self, label: str, position: Sequence[float], force: bool = False):
+        now = time.time()
+        if (
+            not force
+            and self.samples
+            and now - self.last_sample_at < self.sample_interval_sec
+        ):
+            return
+
+        self.samples.append(
+            {
+                "time_sec": now - self.started_at,
+                "label": label,
+                "position": [float(position[0]), float(position[1]), float(position[2])],
+            }
+        )
+        self.last_sample_at = now
+
+
+def save_flight_trace_plot(
+    trace: FlightTrace,
+    output_path: Path,
+    planned_path: List[List[float]] = None,
+    start: Sequence[float] = None,
+    goal: Sequence[float] = None,
+):
+    if not trace.samples:
+        projectairsim_log().info("No flight trace samples to plot")
+        return
+
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    times = [sample["time_sec"] for sample in trace.samples]
+    xs = [sample["position"][0] for sample in trace.samples]
+    ys = [sample["position"][1] for sample in trace.samples]
+    zs = [sample["position"][2] for sample in trace.samples]
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    fig, (xy_ax, z_ax) = plt.subplots(1, 2, figsize=(14, 6))
+
+    if planned_path:
+        xy_ax.plot(
+            [point[0] for point in planned_path],
+            [point[1] for point in planned_path],
+            color="0.55",
+            linestyle="--",
+            linewidth=1.5,
+            label="planned path",
+        )
+    xy_ax.plot(xs, ys, color="dodgerblue", linewidth=2.0, label="actual drone")
+    xy_ax.scatter([xs[0]], [ys[0]], color="dodgerblue", s=60, marker="o", label="trace start")
+    xy_ax.scatter([xs[-1]], [ys[-1]], color="crimson", s=70, marker="x", label="trace end")
+    if start:
+        xy_ax.scatter([start[0]], [start[1]], color="navy", s=45, marker="o", label="requested start")
+    if goal:
+        xy_ax.scatter([goal[0]], [goal[1]], color="darkred", s=60, marker="x", label="requested goal")
+    xy_ax.set_title("Actual Drone NED Track")
+    xy_ax.set_xlabel("NED x / north (m)")
+    xy_ax.set_ylabel("NED y / east (m)")
+    xy_ax.set_aspect("equal", adjustable="box")
+    xy_ax.grid(True, color="0.82")
+    xy_ax.legend(loc="best")
+
+    z_ax.plot(times, zs, color="darkorange", linewidth=2.0)
+    z_ax.set_title("NED z During Flight")
+    z_ax.set_xlabel("time (s)")
+    z_ax.set_ylabel("NED z / down (m)")
+    z_ax.grid(True, color="0.82")
+
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=150)
+    plt.close(fig)
+    projectairsim_log().info("Flight trace plot written to %s", output_path)
+
+
 async def wait_for_px4_ready(drone: Drone, timeout_sec: float):
     timeout_at = time.time() + timeout_sec
     last_message = ""
@@ -188,6 +274,7 @@ async def await_drone_task(
     label: str,
     timeout_sec: float,
     report_interval_sec: float,
+    flight_trace: FlightTrace = None,
 ):
     started_at = time.time()
     last_report_at = started_at
@@ -198,10 +285,15 @@ async def await_drone_task(
         if timeout_sec > 0 and elapsed > timeout_sec:
             drone.cancel_last_task()
             position = get_pose_position_ned(drone)
+            if flight_trace:
+                flight_trace.record(label, position, force=True)
             raise RuntimeError(
                 f"{label} timed out after {timeout_sec:.1f}s at pose "
                 f"{format_vector3(position)}"
             )
+
+        if flight_trace:
+            flight_trace.record(label, get_pose_position_ned(drone))
 
         if now - last_report_at >= report_interval_sec:
             position = get_pose_position_ned(drone)
@@ -215,6 +307,8 @@ async def await_drone_task(
 
     result = await task
     position = get_pose_position_ned(drone)
+    if flight_trace:
+        flight_trace.record(label, position, force=True)
     projectairsim_log().info(
         f"{label} completed with result={result}; pose NED {format_vector3(position)}"
     )
@@ -238,6 +332,7 @@ async def fly_to_point_by_velocity(
     report_interval_sec: float,
     face_travel_direction: bool,
     label: str,
+    flight_trace: FlightTrace = None,
 ):
     await request_px4_control(drone)
     started_at = time.time()
@@ -245,11 +340,15 @@ async def fly_to_point_by_velocity(
 
     while True:
         current = get_pose_position_ned(drone)
+        if flight_trace:
+            flight_trace.record(label, current)
         delta = [target[idx] - current[idx] for idx in range(3)]
         distance = distance_between(current, target)
         elapsed = time.time() - started_at
 
         if distance <= acceptance_m:
+            if flight_trace:
+                flight_trace.record(label, current, force=True)
             projectairsim_log().info(
                 f"{label} reached target {format_vector3(target)}; pose NED "
                 f"{format_vector3(current)}; error {distance:.2f} m"
@@ -302,6 +401,7 @@ async def fly_path_by_velocity(
     timeout_sec: float,
     report_interval_sec: float,
     face_travel_direction: bool,
+    flight_trace: FlightTrace = None,
 ):
     for index, waypoint in enumerate(path[1:], start=1):
         await fly_to_point_by_velocity(
@@ -313,6 +413,7 @@ async def fly_path_by_velocity(
             report_interval_sec,
             face_travel_direction,
             f"Waypoint {index:03d}",
+            flight_trace,
         )
 
 
@@ -323,6 +424,12 @@ async def run_autopilot(args):
         port_services=args.services_port,
     )
     image_display = None
+    flight_trace = (
+        FlightTrace(args.flight_trace_interval_sec)
+        if args.flight_trace_output
+        else None
+    )
+    planned_path_for_trace = None
 
     try:
         projectairsim_log().info("Connecting to Project AirSim")
@@ -377,6 +484,8 @@ async def run_autopilot(args):
             projectairsim_log().info(f"Teleporting '{args.drone_name}' to {start}")
             drone.set_pose(make_pose_ned(start), reset_kinematics=True)
             await asyncio.sleep(args.after_teleport_delay_sec)
+            if flight_trace:
+                flight_trace.record("Teleport start", get_pose_position_ned(drone), force=True)
 
         actors_to_ignore = args.ignore_actor or [args.drone_name]
 
@@ -411,6 +520,7 @@ async def run_autopilot(args):
             raise RuntimeError("A* did not find a path")
 
         path = sparsify_path(dense_path, args.waypoint_spacing_m)
+        planned_path_for_trace = path
         projectairsim_log().info(
             "Planned %d dense points, reduced to %d waypoints, path length %.2f m",
             len(dense_path),
@@ -423,7 +533,9 @@ async def run_autopilot(args):
                 projectairsim_log().info(f"Waypoint {idx:03d}: {point}")
 
         await wait_for_px4_ready(drone, args.px4_ready_timeout_sec)
-        log_pose(drone, "Before arming")
+        before_arming_pose = log_pose(drone, "Before arming")
+        if flight_trace:
+            flight_trace.record("Before arming", before_arming_pose, force=True)
 
         if not drone.enable_api_control():
             raise RuntimeError("Project AirSim did not enable API control")
@@ -438,9 +550,12 @@ async def run_autopilot(args):
                 "Takeoff",
                 args.takeoff_timeout_sec + 5.0,
                 args.pose_report_interval_sec,
+                flight_trace,
             )
         else:
-            log_pose(drone, "Skipping takeoff")
+            skipping_takeoff_pose = log_pose(drone, "Skipping takeoff")
+            if flight_trace:
+                flight_trace.record("Skipping takeoff", skipping_takeoff_pose, force=True)
 
         if not args.teleport_start:
             if args.flight_driver == "velocity":
@@ -454,6 +569,7 @@ async def run_autopilot(args):
                     args.pose_report_interval_sec,
                     args.face_travel_direction,
                     "Move to start",
+                    flight_trace,
                 )
             else:
                 await request_px4_control(drone)
@@ -478,6 +594,7 @@ async def run_autopilot(args):
                     "Move to start",
                     args.move_timeout_sec + 5.0,
                     args.pose_report_interval_sec,
+                    flight_trace,
                 )
 
         if args.flight_driver == "velocity":
@@ -490,6 +607,7 @@ async def run_autopilot(args):
                 args.move_timeout_sec,
                 args.pose_report_interval_sec,
                 args.face_travel_direction,
+                flight_trace,
             )
         else:
             await request_px4_control(drone)
@@ -520,6 +638,7 @@ async def run_autopilot(args):
                 "Follow waypoint path",
                 path_timeout_sec + 5.0,
                 args.pose_report_interval_sec,
+                flight_trace,
             )
         projectairsim_log().info(f"Reached destination {goal}")
 
@@ -532,6 +651,7 @@ async def run_autopilot(args):
                 "Landing",
                 args.land_timeout_sec + 5.0,
                 args.pose_report_interval_sec,
+                flight_trace,
             )
 
         if not args.keep_armed:
@@ -539,6 +659,14 @@ async def run_autopilot(args):
             drone.disable_api_control()
 
     finally:
+        if flight_trace and args.flight_trace_output:
+            save_flight_trace_plot(
+                flight_trace,
+                Path(args.flight_trace_output),
+                planned_path_for_trace,
+                args.start,
+                args.goal,
+            )
         if image_display:
             image_display.stop()
         if client.state:
@@ -601,6 +729,17 @@ def build_parser() -> argparse.ArgumentParser:
         help="Path API timeout. Use 0 to infer from path length and velocity.",
     )
     parser.add_argument("--pose-report-interval-sec", type=float, default=2.0)
+    parser.add_argument(
+        "--flight-trace-output",
+        default="px4_flight_trace.png",
+        help="PNG path for plotting actual drone NED position during flight. Use '' to disable.",
+    )
+    parser.add_argument(
+        "--flight-trace-interval-sec",
+        type=float,
+        default=0.5,
+        help="Minimum time between actual NED pose samples used in the flight trace plot.",
+    )
     parser.add_argument("--after-teleport-delay-sec", type=float, default=2.0)
     parser.add_argument(
         "--ignore-actor",
