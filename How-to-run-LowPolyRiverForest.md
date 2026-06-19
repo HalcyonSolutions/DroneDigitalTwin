@@ -1,7 +1,8 @@
 # How to run the code
 
 ## Setup environment
-
+1. Download environment into project root folder. Download from: [https://drive.google.com/file/d/1cp5fLizh9YM2r82fpCsFRUhZ__Qp8qbL/view?usp=sharing](https://drive.google.com/file/d/1cp5fLizh9YM2r82fpCsFRUhZ__Qp8qbL/view?usp=sharing)
+2. Unpack the downloaded file `tar -xzvf LowPolyRiverForest_Win11.tar.gz`, it should create a folder `.\unreal\LowPolyRiverForest\`
 
 ## How to run the simulation over River-side forest environment
 
