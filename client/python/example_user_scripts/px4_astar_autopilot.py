@@ -770,18 +770,20 @@ async def run_px4_keyboard_control(
             max_yaw_delta,
         )
 
-        if vector_magnitude(commanded_velocity) > 0.05 or vector_magnitude(target_velocity) > 0.0:
+        if (
+            vector_magnitude(commanded_velocity) > 0.05
+            or vector_magnitude(target_velocity) > 0.0
+            or abs(commanded_yaw_rate) > 0.1
+            or abs(target_yaw_rate) > 0.0
+        ):
             await drone.move_by_velocity_body_frame_async(
                 commanded_velocity[0],
                 commanded_velocity[1],
                 commanded_velocity[2],
                 command_duration_sec,
-            )
-
-        if abs(commanded_yaw_rate) > 0.1 or abs(target_yaw_rate) > 0.0:
-            await drone.rotate_by_yaw_rate_async(
-                commanded_yaw_rate,
-                command_duration_sec,
+                yaw_control_mode=YawControlMode.MaxDegreeOfFreedom,
+                yaw_is_rate=True,
+                yaw=math.radians(commanded_yaw_rate),
             )
 
         await asyncio.sleep(0.02)
