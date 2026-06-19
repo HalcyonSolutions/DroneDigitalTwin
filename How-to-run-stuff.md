@@ -100,6 +100,7 @@ This example uses Free Fab provided River-side ForestDomeEnv.uproject
 
 1. Open the River-side ForestDomeEnv.uproject in Unreal Engine Editor and press play button
 2. Run
+
 ```python
    python px4_map_viewer.py `
   --start "40,-20,-6" `
@@ -117,9 +118,11 @@ It saves both, 2D and 3D plots of the map.
 
 
 ### How to fly a mission manually using keyboard
+
 1. Open the River-side ForestDomeEnv.uproject in Unreal Engine Editor and press play button
 2. Run PX4 keyboard control from the same script/scene used for A* missions. Use the printed live NED as the start point for PX4 missions.
 3. When the script says the generated scene is loaded and is waiting for PX4, launch or restart PX4 by running `make px4_sitl_default none_iris`
+
 ```python
 python px4_astar_autopilot.py `
   --keyboard-control `
@@ -130,9 +133,11 @@ python px4_astar_autopilot.py `
 ```
 
 ### How to fly a mission with PX4
+
 1. Open the River-side ForestDomeEnv.uproject in Unreal Engine Editor and press play button
 2. Run the command below, the drone will cross the river
 3. When the script says the generated scene is loaded and is waiting for PX4, launch or restart PX4 by running `make px4_sitl_default none_iris`
+
 ```python
 python px4_astar_autopilot.py `
   --scene scene_px4_sitl.jsonc `
@@ -146,9 +151,9 @@ python px4_astar_autopilot.py `
   --start-as-scene-origin `
   --live-ned-interval-sec 1
 ```
-add `--plan-only` if you want to see the planned path without flying the drone.
 
-Short-path: start at "72,-8,-4" and goal at "33, -19, -6"
-Long-path" start at "72,-8,-4" and goal at "-50, 76, -25"
+- add `--plan-only` if you want to see the planned path without flying the drone.
+- Short-path: start at "72,-8,-4" and goal at "33, -19, -6"
+- Long-path: start at "72,-8,-4" and goal at "-50, 76, -25"
 
 *Unresolved Problem: Encountered when working on Windows 11 using WSL2*: to rerun the sim, user has to restart Unreal Engine Editor and PX4 SITL. The script will not work if the sim is restarted without restarting PX4 SITL.
