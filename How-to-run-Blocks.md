@@ -18,6 +18,24 @@ python px4_astar_autopilot.py `
   --px4-ready-timeout-sec 300
 ```
 
+If PX4 flight still feels jerky, lower acceleration and give corners more room:
+
+```python
+python px4_astar_autopilot.py `
+  --start "30,0,-6" `
+  --goal "30,-48,-10" `
+  --velocity-mps 2 `
+  --acceleration-limit-mps2 1.5 `
+  --slowdown-distance-m 6 `
+  --waypoint-acceptance-m 1.5 `
+  --land-at-goal
+```
+
+For `--keyboard-control`, tune `--keyboard-acceleration-limit-mps2` and
+`--keyboard-yaw-acceleration-dps2` if key presses still feel too sharp.
+The script now keeps yaw stable by default for smoother motion; add
+`--face-travel-direction` if you want the drone nose to turn into each path leg.
+
 ### Fast bug-fixing loop for `px4_astar_autopilot.py`
 
 Keep Unreal open and pressing Play. Most Python bugs do not require restarting the

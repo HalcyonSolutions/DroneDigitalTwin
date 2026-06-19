@@ -41,7 +41,9 @@ python px4_astar_autopilot.py `
   --start "72,-8,-4" `
   --start-as-scene-origin `
   --px4-ready-timeout-sec 300 `
-  --live-ned-interval-sec 1.0
+  --live-ned-interval-sec 1.0 `
+  --keyboard-acceleration-limit-mps2 1 `
+  --keyboard-yaw-acceleration-dps2 20
 ```
 
 ### How to fly a mission with PX4
@@ -65,6 +67,9 @@ python px4_astar_autopilot.py `
 ```
 
 - add `--plan-only` if you want to see the planned path without flying the drone.
+- add `--acceleration-limit-mps2 1.5 --slowdown-distance-m 6 --waypoint-acceptance-m 1.5` if the PX4 mission still feels too jerky.
+- for `--keyboard-control`, tune `--keyboard-acceleration-limit-mps2` and `--keyboard-yaw-acceleration-dps2` if key presses feel too sharp.
+- yaw is kept stable by default for smoother motion; add `--face-travel-direction` if you want the drone nose to turn into each path leg.
 - Short-path: start at "72,-8,-4" and goal at "33, -19, -6"
 - Long-path: start at "72,-8,-4" and goal at "-50, 76, -25"
 
