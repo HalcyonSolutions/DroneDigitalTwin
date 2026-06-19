@@ -203,6 +203,33 @@ def move_scalar_toward(current: float, target: float, max_delta: float) -> float
     return current + math.copysign(max_delta, delta)
 
 
+def clamp(value: float, minimum: float, maximum: float) -> float:
+    return max(minimum, min(maximum, value))
+
+
+def wrap_angle_rad(angle: float) -> float:
+    return (angle + math.pi) % (2.0 * math.pi) - math.pi
+
+
+def yaw_from_quaternion(rotation) -> float:
+    w = float(rotation["w"])
+    x = float(rotation["x"])
+    y = float(rotation["y"])
+    z = float(rotation["z"])
+    return math.atan2(
+        2.0 * (w * z + x * y),
+        1.0 - 2.0 * (y * y + z * z),
+    )
+
+
+def get_pose_yaw_ned(drone: Drone) -> float:
+    pose = drone.get_ground_truth_kinematics()["pose"]
+    rotation = pose.get("orientation") or pose.get("rotation")
+    if rotation is None:
+        return 0.0
+    return yaw_from_quaternion(rotation)
+
+
 async def teleport_and_verify(
     drone: Drone,
     target: Sequence[float],
@@ -540,6 +567,7 @@ async def command_world_velocity(
     drone: Drone,
     velocity: Sequence[float],
     duration_sec: float,
+    yaw_rate_radps: float = 0.0,
 ):
     await drone.move_by_velocity_async(
         v_north=velocity[0],
@@ -548,7 +576,7 @@ async def command_world_velocity(
         duration=duration_sec,
         yaw_control_mode=YawControlMode.MaxDegreeOfFreedom,
         yaw_is_rate=True,
-        yaw=0.0,
+        yaw=yaw_rate_radps,
     )
 
 
@@ -610,6 +638,7 @@ async def fly_to_point_by_velocity(
     command_duration_sec: float,
     acceleration_limit_mps2: float,
     slowdown_distance_m: float,
+    path_yaw_rate_dps: float,
     initial_velocity: Sequence[float] = None,
     stop_at_target: bool = True,
     request_control: bool = True,
@@ -627,6 +656,7 @@ async def fly_to_point_by_velocity(
     )
     command_duration_sec = max(0.05, command_duration_sec)
     max_velocity_delta = max(0.0, acceleration_limit_mps2) * command_duration_sec
+    max_yaw_rate_radps = math.radians(max(0.0, path_yaw_rate_dps))
     slowdown_distance_m = max(acceptance_m, slowdown_distance_m)
 
     while True:
@@ -680,20 +710,25 @@ async def fly_to_point_by_velocity(
             desired_velocity,
             max_velocity_delta,
         )
-        yaw_control_mode = (
-            YawControlMode.ForwardOnly
-            if face_travel_direction
-            else YawControlMode.MaxDegreeOfFreedom
-        )
+        yaw_rate_radps = 0.0
+        horizontal_speed = math.hypot(commanded_velocity[0], commanded_velocity[1])
+        if face_travel_direction and horizontal_speed > 0.05 and max_yaw_rate_radps > 0.0:
+            desired_yaw = math.atan2(commanded_velocity[1], commanded_velocity[0])
+            yaw_error = wrap_angle_rad(desired_yaw - get_pose_yaw_ned(drone))
+            yaw_rate_radps = clamp(
+                yaw_error / command_duration_sec,
+                -max_yaw_rate_radps,
+                max_yaw_rate_radps,
+            )
 
         await drone.move_by_velocity_async(
             v_north=commanded_velocity[0],
             v_east=commanded_velocity[1],
             v_down=commanded_velocity[2],
             duration=command_duration_sec,
-            yaw_control_mode=yaw_control_mode,
-            yaw_is_rate=not face_travel_direction,
-            yaw=0.0,
+            yaw_control_mode=YawControlMode.MaxDegreeOfFreedom,
+            yaw_is_rate=True,
+            yaw=yaw_rate_radps,
         )
         await asyncio.sleep(command_duration_sec)
 
@@ -710,6 +745,7 @@ async def fly_path_by_velocity(
     acceleration_limit_mps2: float,
     slowdown_distance_m: float,
     waypoint_hold_sec: float,
+    path_yaw_rate_dps: float,
     flight_trace: FlightTrace = None,
     live_ned: LiveNedDisplay = None,
 ):
@@ -731,6 +767,7 @@ async def fly_path_by_velocity(
             command_duration_sec,
             acceleration_limit_mps2,
             slowdown_distance_m,
+            path_yaw_rate_dps,
             commanded_velocity,
             is_final_waypoint or should_hold,
             False,
@@ -1132,6 +1169,7 @@ async def run_autopilot(args):
                     args.velocity_command_duration_sec,
                     args.acceleration_limit_mps2,
                     args.slowdown_distance_m,
+                    args.path_yaw_rate_dps,
                     None,
                     True,
                     True,
@@ -1179,6 +1217,7 @@ async def run_autopilot(args):
                 args.acceleration_limit_mps2,
                 args.slowdown_distance_m,
                 args.waypoint_hold_sec,
+                args.path_yaw_rate_dps,
                 flight_trace,
                 live_ned,
             )
@@ -1352,6 +1391,12 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         default=4.0,
         help="Distance over which velocity mode eases down near each waypoint.",
+    )
+    parser.add_argument(
+        "--path-yaw-rate-dps",
+        type=float,
+        default=15.0,
+        help="Maximum yaw rate used by --face-travel-direction in velocity flight mode.",
     )
     parser.add_argument(
         "--flight-driver",
