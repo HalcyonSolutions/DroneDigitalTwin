@@ -389,6 +389,7 @@ DroneSimDev_ENV/
 
 # Environment/Map
 unreal/LowPolyRiverForest/
+LowPolyRiverForest_Win11.tar.gz
 
 # MISC
 test.cpp
