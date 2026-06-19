@@ -29,6 +29,7 @@ python px4_astar_autopilot.py `
   --slowdown-distance-m 6 `
   --waypoint-acceptance-m 1.5 `
   --waypoint-hold-sec 3 `
+  --path-yaw-rate-dps 10 `
   --land-at-goal
 ```
 
