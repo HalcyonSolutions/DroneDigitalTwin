@@ -59,6 +59,7 @@ python px4_astar_autopilot.py `
   --start-as-scene-origin `
   --goal "33, -19, -6" `
   --velocity-mps 2 `
+  --face-travel-direction `
   --land-at-goal `
   --print-waypoints `
   --px4-ready-timeout-sec 300 `
@@ -66,13 +67,14 @@ python px4_astar_autopilot.py `
   --live-ned-interval-sec 1 `
   --acceleration-limit-mps2 1.5 `
   --slowdown-distance-m 6 `
-  --waypoint-acceptance-m 1.5
+  --waypoint-acceptance-m 1.5 `
+  --face-travel-direction
 ```
 
 - add `--plan-only` if you want to see the planned path without flying the drone.
 - add `--acceleration-limit-mps2 1.5 --slowdown-distance-m 6 --waypoint-acceptance-m 1.5` if the PX4 mission still feels too jerky.
 - for `--keyboard-control`, tune `--keyboard-acceleration-limit-mps2 4` and `--keyboard-yaw-acceleration-dps2 110` if key presses feel too sharp.
-- yaw is kept stable by default for smoother motion; add `--face-travel-direction` if you want the drone nose to turn into each path leg.
+- yaw is kept stable by default for the smoothest motion; use `--face-travel-direction` when you want the Chase camera to stay behind the drone along the path.
 - Short-path: start at "72,-8,-4" and goal at "33, -19, -6"
 - Long-path: start at "72,-8,-4" and goal at "-50, 76, -25"
 
