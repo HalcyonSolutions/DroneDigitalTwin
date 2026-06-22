@@ -15,8 +15,11 @@ Examples:
 
 import argparse
 import asyncio
+import json
 import math
 import queue
+import shutil
+import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -43,6 +46,25 @@ CAMERA_CHOICES = tuple(RGB_CAMERA_SENSORS.keys()) + (
     "all",
 )
 DEPTH_UNIT_CHOICES = ("m", "mm")
+LIDAR_TYPE_CHOICES = (
+    "generic_cylindrical",
+    "generic_rosette",
+    "livox_mid70",
+    "livox_avia",
+    "gpu_cylindrical",
+)
+LIDAR_QUALITY_PRESETS = {
+    "dense-forward": {
+        "number-of-channels": 32,
+        "points-per-second": 300000,
+        "report-frequency": 10.0,
+        "horizontal-rotation-frequency": 5.0,
+        "horizontal-fov-start-deg": 300.0,
+        "horizontal-fov-end-deg": 60.0,
+        "vertical-fov-lower-deg": -45.0,
+        "vertical-fov-upper-deg": 15.0,
+    }
+}
 DEFAULT_CAMERA_ORIGINS = {
     "FrontCamera": ((0.5, 0.0, 0.0), (0.0, 0.0, 0.0)),
     "LeftCamera": ((0.0, -0.5, 0.0), (0.0, 0.0, math.radians(-90.0))),
@@ -247,6 +269,48 @@ def parse_vector3(value: str) -> Sequence[float]:
         raise argparse.ArgumentTypeError(f"Coordinates must be numeric: '{value}'") from exc
 
 
+def parse_float2(value: str) -> Sequence[float]:
+    parts = str(value).replace(",", " ").split()
+    if len(parts) != 2:
+        raise argparse.ArgumentTypeError(
+            f"Expected two numeric values, got {len(parts)} from '{value}'"
+        )
+    try:
+        return [float(part) for part in parts]
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(f"Values must be numeric: '{value}'") from exc
+
+
+def positive_int(value: str) -> int:
+    try:
+        parsed = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(f"Expected an integer, got '{value}'") from exc
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("Value must be greater than zero")
+    return parsed
+
+
+def positive_float(value: str) -> float:
+    try:
+        parsed = float(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(f"Expected a number, got '{value}'") from exc
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("Value must be greater than zero")
+    return parsed
+
+
+def nonnegative_float(value: str) -> float:
+    try:
+        parsed = float(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(f"Expected a number, got '{value}'") from exc
+    if parsed < 0:
+        raise argparse.ArgumentTypeError("Value must be zero or greater")
+    return parsed
+
+
 def make_pose_ned(position_ned: Sequence[float]):
     from projectairsim.types import Pose, Quaternion, Vector3
 
@@ -290,13 +354,153 @@ def load_jsonc(path: Path):
     return commentjson.loads(path.read_text(encoding="utf-8"))
 
 
+def lidar_override_args_present(args) -> bool:
+    return any(
+        value is not None
+        for value in (
+            args.lidar_quality_preset,
+            args.lidar_type,
+            args.lidar_channels,
+            args.lidar_range_m,
+            args.lidar_points_per_second,
+            args.lidar_report_frequency,
+            args.lidar_rotation_hz,
+            args.lidar_horizontal_fov,
+            args.lidar_vertical_fov,
+        )
+    )
+
+
+def build_lidar_overrides(args) -> Dict:
+    overrides = {}
+    if args.lidar_quality_preset:
+        overrides.update(LIDAR_QUALITY_PRESETS[args.lidar_quality_preset])
+
+    if args.lidar_type is not None:
+        overrides["lidar-type"] = args.lidar_type
+    if args.lidar_channels is not None:
+        overrides["number-of-channels"] = args.lidar_channels
+    if args.lidar_range_m is not None:
+        overrides["range"] = args.lidar_range_m
+    if args.lidar_points_per_second is not None:
+        overrides["points-per-second"] = args.lidar_points_per_second
+    if args.lidar_report_frequency is not None:
+        overrides["report-frequency"] = args.lidar_report_frequency
+    if args.lidar_rotation_hz is not None:
+        overrides["horizontal-rotation-frequency"] = args.lidar_rotation_hz
+    if args.lidar_horizontal_fov is not None:
+        start_deg, end_deg = args.lidar_horizontal_fov
+        overrides["horizontal-fov-start-deg"] = start_deg
+        overrides["horizontal-fov-end-deg"] = end_deg
+    if args.lidar_vertical_fov is not None:
+        lower_deg, upper_deg = args.lidar_vertical_fov
+        overrides["vertical-fov-lower-deg"] = lower_deg
+        overrides["vertical-fov-upper-deg"] = upper_deg
+
+    return overrides
+
+
+def make_temp_lidar_config(args):
+    if not lidar_override_args_present(args):
+        return None, args.scene, args.sim_config_path
+
+    scene_path = resolve_config_path(args.scene, args.sim_config_path)
+    if not scene_path.exists():
+        raise FileNotFoundError(f"Scene config not found: {scene_path}")
+
+    scene_config = load_jsonc(scene_path)
+    actors = scene_config.get("actors", [])
+    target_actor = next(
+        (
+            actor
+            for actor in actors
+            if actor.get("type") == "robot" and actor.get("name") == args.drone_name
+        ),
+        None,
+    )
+    if target_actor is None or not target_actor.get("robot-config"):
+        raise RuntimeError(
+            f"Could not find robot actor '{args.drone_name}' with a robot-config"
+        )
+
+    temp_dir = tempfile.TemporaryDirectory(prefix="check_all_cameras_lidar_")
+    temp_config_dir = Path(temp_dir.name)
+    overrides = build_lidar_overrides(args)
+
+    try:
+        for actor_index, actor in enumerate(actors):
+            if actor.get("type") != "robot" or not actor.get("robot-config"):
+                continue
+
+            robot_config_path = resolve_config_path(
+                actor["robot-config"],
+                str(scene_path.parent),
+            )
+            robot_config = load_jsonc(robot_config_path)
+
+            if actor is target_actor:
+                lidar_sensor = next(
+                    (
+                        sensor
+                        for sensor in robot_config.get("sensors", [])
+                        if sensor.get("id") == args.lidar_sensor
+                    ),
+                    None,
+                )
+                if lidar_sensor is None:
+                    raise RuntimeError(
+                        f"LiDAR sensor '{args.lidar_sensor}' was not found in "
+                        f"{robot_config_path}"
+                )
+                lidar_sensor.update(overrides)
+
+            suffix = robot_config_path.suffix or ".jsonc"
+            output_name = f"{robot_config_path.stem}_{actor_index}{suffix}"
+            (temp_config_dir / output_name).write_text(
+                json.dumps(robot_config, indent=2),
+                encoding="utf-8",
+            )
+            actor["robot-config"] = output_name
+
+        for env_actor in scene_config.get("environment-actors", []):
+            if env_actor.get("type") != "env_actor" or not env_actor.get(
+                "env-actor-config"
+            ):
+                continue
+            env_config_path = resolve_config_path(
+                env_actor["env-actor-config"],
+                str(scene_path.parent),
+            )
+            shutil.copy2(env_config_path, temp_config_dir / env_config_path.name)
+            env_actor["env-actor-config"] = env_config_path.name
+
+        temp_scene_name = scene_path.name
+        (temp_config_dir / temp_scene_name).write_text(
+            json.dumps(scene_config, indent=2),
+            encoding="utf-8",
+        )
+    except Exception:
+        temp_dir.cleanup()
+        raise
+
+    projectairsim_log().info(
+        "Using temporary LiDAR config overrides for %s: %s",
+        args.lidar_sensor,
+        overrides,
+    )
+    return temp_dir, temp_scene_name, str(temp_config_dir)
+
+
 def read_camera_origin_from_config(args, camera_id: str):
     default_origin = DEFAULT_CAMERA_ORIGINS.get(
         camera_id,
         ((0.0, 0.0, 0.0), (0.0, 0.0, 0.0)),
     )
     try:
-        scene_path = resolve_config_path(args.scene, args.sim_config_path)
+        scene_path = resolve_config_path(
+            getattr(args, "effective_scene", args.scene),
+            getattr(args, "effective_sim_config_path", args.sim_config_path),
+        )
         scene_config = load_jsonc(scene_path)
         actor = next(
             (
@@ -592,14 +796,21 @@ async def main(args):
     lidar_display = None
     flight_task = None
     safety_monitor = None
+    temp_config_dir = None
 
     try:
+        temp_config_dir, effective_scene, effective_sim_config_path = make_temp_lidar_config(
+            args
+        )
+        args.effective_scene = effective_scene
+        args.effective_sim_config_path = effective_sim_config_path
+
         client.connect()
         world = World(
             client,
-            args.scene,
+            effective_scene,
             delay_after_load_sec=args.load_delay_sec,
-            sim_config_path=args.sim_config_path,
+            sim_config_path=effective_sim_config_path,
         )
         drone = Drone(client, world, args.drone_name)
 
@@ -690,6 +901,8 @@ async def main(args):
             lidar_display.stop()
         if client.state:
             client.disconnect()
+        if temp_config_dir:
+            temp_config_dir.cleanup()
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -776,6 +989,76 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.set_defaults(depth_invert=True)
     parser.add_argument("--lidar-sensor", default="lidar1")
+    parser.add_argument(
+        "--lidar-quality-preset",
+        choices=tuple(LIDAR_QUALITY_PRESETS.keys()),
+        default=None,
+        help=(
+            "Apply a LiDAR quality preset before loading the scene. "
+            "Explicit --lidar-* quality flags override preset values."
+        ),
+    )
+    parser.add_argument(
+        "--lidar-type",
+        choices=LIDAR_TYPE_CHOICES,
+        default=None,
+        help="Override the configured LiDAR scan type before loading the scene.",
+    )
+    parser.add_argument(
+        "--lidar-channels",
+        type=positive_int,
+        default=None,
+        metavar="N",
+        help="Override number-of-channels for the selected LiDAR sensor.",
+    )
+    parser.add_argument(
+        "--lidar-range-m",
+        type=positive_float,
+        default=None,
+        metavar="M",
+        help="Override maximum LiDAR sensing range in meters.",
+    )
+    parser.add_argument(
+        "--lidar-points-per-second",
+        type=positive_int,
+        default=None,
+        metavar="N",
+        help="Override total LiDAR points generated per second.",
+    )
+    parser.add_argument(
+        "--lidar-report-frequency",
+        type=nonnegative_float,
+        default=None,
+        metavar="HZ",
+        help=(
+            "Override LiDAR publish rate. For preview density, 10 Hz often "
+            "shows many more points per displayed frame than the default 0."
+        ),
+    )
+    parser.add_argument(
+        "--lidar-rotation-hz",
+        type=positive_float,
+        default=None,
+        metavar="HZ",
+        help="Override horizontal-rotation-frequency for cylindrical LiDAR.",
+    )
+    parser.add_argument(
+        "--lidar-horizontal-fov",
+        type=parse_float2,
+        default=None,
+        metavar="START,END",
+        help=(
+            "Override horizontal FOV start/end degrees. 0 is forward; "
+            "for example 300,60 is a forward-facing 120 degree cone."
+        ),
+    )
+    parser.add_argument(
+        "--lidar-vertical-fov",
+        type=parse_float2,
+        default=None,
+        metavar="LOWER,UPPER",
+        help="Override vertical FOV lower/upper degrees, for example -45,15.",
+    )
     parser.add_argument("--preview-width", type=int, default=800)
     parser.add_argument("--preview-height", type=int, default=450)
     parser.add_argument("--no-display", action="store_true")
