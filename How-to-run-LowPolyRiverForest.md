@@ -82,3 +82,29 @@ python px4_astar_autopilot.py `
 - Long-path: start at "72,-8,-4" and goal at "-50, 76, -25"
 
 *Unresolved Problem: Encountered when working on Windows 11 using WSL2*: to rerun the sim, user has to restart Unreal Engine Editor and PX4 SITL. The script will not work if the sim is restarted without restarting PX4 SITL.
+
+### How to use sensors in the River-side Forest environment
+
+1. Open the River-side ForestDomeEnv.uproject in Unreal Engine Editor and press play button
+2. Run
+```python
+python check_all_cameras.py `
+  --camera front_rgb `
+  --fly-pattern `
+  --avoid-obstacles `
+  --teleport-start `
+  --start 0,0,-28 `
+  --front-rgb-angle 25 `
+```
+
+```python
+python check_all_cameras.py `
+  --camera depth `
+  --fly-pattern `
+  --avoid-obstacles `
+  --teleport-start `
+  --start 0,0,-28 `
+  --depth-angle 25 `
+   --depth-min-m 0.1 `
+   --depth-max-m 80
+```
