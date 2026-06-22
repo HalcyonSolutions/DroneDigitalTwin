@@ -108,3 +108,16 @@ python check_all_cameras.py `
    --depth-min-m 0.1 `
    --depth-max-m 80
 ```
+
+```python
+python check_all_cameras.py `
+  --camera all `
+  --fly-pattern `
+  --avoid-obstacles `
+  --teleport-start `
+  --start 0,0,-28 `
+  --depth-angle 25 `
+  --front-rgb-angle 25 `
+   --depth-min-m 0.1 `
+   --depth-max-m 80
+```

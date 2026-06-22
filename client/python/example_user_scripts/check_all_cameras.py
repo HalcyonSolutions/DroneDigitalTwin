@@ -229,7 +229,7 @@ class OpenCvPreview:
 
 def selected_modes(camera: str) -> Iterable[str]:
     if camera == "all":
-        return ("front_rgb", "left_rgb", "right_rgb", "down_rgb", "depth", "lidar")
+        return ("front_rgb", "depth", "lidar")
     if camera == "all_rgb":
         return ("front_rgb", "left_rgb", "right_rgb", "down_rgb")
     return (camera,)
