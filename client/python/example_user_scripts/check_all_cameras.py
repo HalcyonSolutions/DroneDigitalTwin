@@ -15,16 +15,18 @@ Examples:
 
 import argparse
 import asyncio
+import math
 import queue
 import time
 from dataclasses import dataclass
+from pathlib import Path
 from threading import Thread
 from typing import Dict, Iterable, Optional, Sequence
 
 import numpy as np
 
 from projectairsim import Drone, ProjectAirSimClient, World
-from projectairsim.utils import projectairsim_log, unpack_image
+from projectairsim.utils import projectairsim_log, rpy_to_quaternion, unpack_image
 
 
 RGB_CAMERA_SENSORS = {
@@ -41,6 +43,12 @@ CAMERA_CHOICES = tuple(RGB_CAMERA_SENSORS.keys()) + (
     "all",
 )
 DEPTH_UNIT_CHOICES = ("m", "mm")
+DEFAULT_CAMERA_ORIGINS = {
+    "FrontCamera": ((0.5, 0.0, 0.0), (0.0, 0.0, 0.0)),
+    "LeftCamera": ((0.0, -0.5, 0.0), (0.0, 0.0, math.radians(-90.0))),
+    "RightCamera": ((0.0, 0.5, 0.0), (0.0, 0.0, math.radians(90.0))),
+    "DownCamera": ((0.0, 0.0, 0.0), (0.0, math.radians(-90.0), 0.0)),
+}
 
 
 def depth_frame_to_meters(frame, units: str):
@@ -253,6 +261,175 @@ def make_pose_ned(position_ned: Sequence[float]):
     )
 
 
+def parse_float3(value: str) -> Sequence[float]:
+    parts = str(value).replace(",", " ").split()
+    if len(parts) != 3:
+        raise ValueError(f"Expected three values, got '{value}'")
+    return [float(part) for part in parts]
+
+
+def resolve_config_path(config_name: str, sim_config_path: str) -> Path:
+    config_path = Path(config_name)
+    if config_path.is_absolute():
+        return config_path
+
+    config_dir = Path(sim_config_path)
+    candidates = [
+        config_dir / config_path,
+        Path(__file__).resolve().parent / config_dir / config_path,
+    ]
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    return candidates[0]
+
+
+def load_jsonc(path: Path):
+    import commentjson
+
+    return commentjson.loads(path.read_text(encoding="utf-8"))
+
+
+def read_camera_origin_from_config(args, camera_id: str):
+    default_origin = DEFAULT_CAMERA_ORIGINS.get(
+        camera_id,
+        ((0.0, 0.0, 0.0), (0.0, 0.0, 0.0)),
+    )
+    try:
+        scene_path = resolve_config_path(args.scene, args.sim_config_path)
+        scene_config = load_jsonc(scene_path)
+        actor = next(
+            (
+                item
+                for item in scene_config.get("actors", [])
+                if item.get("type") == "robot" and item.get("name") == args.drone_name
+            ),
+            None,
+        )
+        if actor is None or not actor.get("robot-config"):
+            return default_origin
+
+        robot_config_path = resolve_config_path(
+            actor["robot-config"],
+            str(scene_path.parent),
+        )
+        robot_config = load_jsonc(robot_config_path)
+        sensor = next(
+            (
+                item
+                for item in robot_config.get("sensors", [])
+                if item.get("id") == camera_id
+            ),
+            None,
+        )
+        if sensor is None:
+            return default_origin
+
+        origin = sensor.get("origin", {})
+        translation = parse_float3(origin.get("xyz", "0 0 0"))
+        if origin.get("rpy-deg") is not None:
+            rotation = [
+                math.radians(component)
+                for component in parse_float3(origin["rpy-deg"])
+            ]
+        else:
+            rotation = parse_float3(origin.get("rpy", "0 0 0"))
+        return translation, rotation
+    except Exception as exc:
+        projectairsim_log().warning(
+            "Could not read configured origin for %s; using default pose: %s",
+            camera_id,
+            exc,
+        )
+        return default_origin
+
+
+def make_camera_angle_pose(args, camera_id: str, angle_deg: float):
+    from projectairsim.types import Pose, Quaternion, Vector3
+
+    translation_xyz, base_rpy = read_camera_origin_from_config(args, camera_id)
+    roll, _, yaw = base_rpy
+    pitch = math.radians(-angle_deg)
+    w, x, y, z = rpy_to_quaternion(roll, pitch, yaw)
+    return Pose(
+        {
+            "translation": Vector3(
+                {
+                    "x": translation_xyz[0],
+                    "y": translation_xyz[1],
+                    "z": translation_xyz[2],
+                }
+            ),
+            "rotation": Quaternion({"w": w, "x": x, "y": y, "z": z}),
+            "frame_id": "DEFAULT_ID",
+        }
+    )
+
+
+def add_camera_angle_request(requests, camera_id: str, label: str, angle_deg):
+    if angle_deg is None:
+        return
+
+    if camera_id in requests:
+        existing_angle, labels = requests[camera_id]
+        if not math.isclose(existing_angle, angle_deg, abs_tol=1e-6):
+            raise ValueError(
+                f"{camera_id} is used by both {', '.join(labels)} and {label}, "
+                f"but requested different angles ({existing_angle:g} and "
+                f"{angle_deg:g} degrees). Use matching angles or configure "
+                "separate RGB/depth camera sensors."
+            )
+        labels.append(label)
+        return
+
+    requests[camera_id] = (angle_deg, [label])
+
+
+def apply_requested_camera_angles(drone: Drone, args, modes: Sequence[str]):
+    requests = {}
+
+    for mode in modes:
+        if mode == "front_rgb":
+            add_camera_angle_request(
+                requests,
+                RGB_CAMERA_SENSORS[mode],
+                "front RGB",
+                args.front_rgb_angle,
+            )
+        elif mode == "rgb":
+            add_camera_angle_request(
+                requests,
+                args.rgb_sensor or RGB_CAMERA_SENSORS[mode],
+                "RGB",
+                args.front_rgb_angle,
+            )
+
+    if "depth" in modes:
+        add_camera_angle_request(
+            requests,
+            args.depth_sensor,
+            "depth",
+            args.depth_angle,
+        )
+
+    for camera_id, (angle_deg, labels) in requests.items():
+        if camera_id not in drone.sensors:
+            raise RuntimeError(
+                f"Cannot set angle for camera '{camera_id}'. Available sensors: "
+                f"{sorted(drone.sensors.keys())}"
+            )
+
+        pose = make_camera_angle_pose(args, camera_id, angle_deg)
+        if not drone.set_camera_pose(camera_id, pose):
+            raise RuntimeError(f"Failed to set {camera_id} angle to {angle_deg:g} deg")
+        projectairsim_log().info(
+            "Set %s camera angle to %.2f deg down from straight ahead for %s",
+            camera_id,
+            angle_deg,
+            ", ".join(labels),
+        )
+
+
 def summarize_image(image) -> str:
     encoding = image.get("encoding", "unknown")
     width = image.get("width", "?")
@@ -460,6 +637,8 @@ async def main(args):
                 args.obstacle_roi_fraction,
             )
 
+        apply_requested_camera_angles(drone, args, modes)
+
         for mode in modes:
             if mode in RGB_CAMERA_SENSORS:
                 subscribe_rgb(client, drone, args, stats, preview, mode)
@@ -546,9 +725,29 @@ def build_parser() -> argparse.ArgumentParser:
         help="Override the sensor used by --camera rgb. Directional rgb modes use their named sensors.",
     )
     parser.add_argument(
+        "--front-rgb-angle",
+        type=float,
+        default=None,
+        metavar="DEG",
+        help=(
+            "Tilt the selected front RGB camera down by DEG degrees from straight "
+            "ahead. For example, 45 points halfway between the horizon and ground."
+        ),
+    )
+    parser.add_argument(
         "--depth-sensor",
         default="FrontCamera",
         help="Depth camera sensor to validate. Use DownCamera for the old downward view.",
+    )
+    parser.add_argument(
+        "--depth-angle",
+        type=float,
+        default=None,
+        metavar="DEG",
+        help=(
+            "Tilt the selected depth camera down by DEG degrees from straight "
+            "ahead. If depth and RGB use the same sensor, their angles must match."
+        ),
     )
     parser.add_argument(
         "--depth-min-m",
