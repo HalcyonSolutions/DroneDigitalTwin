@@ -152,5 +152,20 @@ python fpv_route_overlay.py `
   --path-yaw-rate-dps 10
 ```
 
+```python
+python fpv_route_overlay.py `
+  --start "72,-8,-4" `
+  --start-as-scene-origin `
+  --goal "-50, 76, -25" `
+  --front-rgb-angle 25 `
+  --waypoint-distance-m 30 `
+  --min-altitude 32 `
+  --velocity-mps 3 `
+  --slowdown-distance-m 1 `
+  --waypoint-acceptance-m 1.5 `
+  --waypoint-hold-sec 0 `
+  --path-yaw-rate-dps 10
+```
+
 - Short-path: start at "72,-8,-4" and goal at "33, -19, -6"
 - Long-path: start at "72,-8,-4" and goal at "-50, 76, -25"
