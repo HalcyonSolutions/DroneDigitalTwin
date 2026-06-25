@@ -124,6 +124,29 @@ def resolve_config_path(config_name: str, sim_config_path: str) -> Path:
     return candidates[0]
 
 
+def prepare_video_output_path(video_path: str) -> Optional[Path]:
+    if not video_path:
+        projectairsim_log().info("FPV video recording disabled")
+        return None
+
+    requested_path = Path(video_path).expanduser()
+    if requested_path.suffix.lower() == ".mp4":
+        output_dir = requested_path.parent
+        output_path = requested_path
+    else:
+        output_dir = requested_path
+        timestamp = time.strftime("%Y%m%d_%H%M%S")
+        output_path = output_dir / f"fpv_route_overlay_{timestamp}.mp4"
+
+    if not output_dir.exists():
+        output_dir.mkdir(parents=True, exist_ok=True)
+        projectairsim_log().info("Created FPV video directory: %s", output_dir)
+    if not output_dir.is_dir():
+        raise RuntimeError(f"FPV video path is not a directory: {output_dir}")
+
+    return output_path
+
+
 def load_jsonc(path: Path):
     return commentjson.loads(path.read_text(encoding="utf-8"))
 
@@ -563,6 +586,8 @@ class FpvWaypointOverlayDisplay:
         resize_y: Optional[int],
         draw_edge_indicators: bool,
         reached_distance_m: float,
+        max_fps: float,
+        video_output_path: Optional[Path],
     ):
         self.window_name = window_name
         self.waypoints = list(waypoints)
@@ -572,6 +597,9 @@ class FpvWaypointOverlayDisplay:
         self.draw_edge_indicators = draw_edge_indicators
         self.reached_distance_m = max(0.1, reached_distance_m)
         self.reached_waypoints = [False for _ in self.waypoints]
+        self.max_fps = max(1.0, max_fps)
+        self.video_output_path = video_output_path
+        self.video_writer = None
         self.image_queue = queue.SimpleQueue()
         self.buffer_size = 3
         self.running = False
@@ -603,8 +631,17 @@ class FpvWaypointOverlayDisplay:
         import cv2
 
         created = False
+        frame_interval_sec = 1.0 / self.max_fps
+        next_frame_at = time.monotonic()
         try:
             while self.running:
+                now = time.monotonic()
+                if now < next_frame_at:
+                    wait_ms = max(1, int((next_frame_at - now) * 1000.0))
+                    if cv2.waitKey(wait_ms) == 27:
+                        self.running = False
+                    continue
+
                 if self.image_queue.empty():
                     if cv2.waitKey(1) == 27:
                         self.running = False
@@ -630,6 +667,8 @@ class FpvWaypointOverlayDisplay:
                 if self.resize_x is not None and self.resize_y is not None:
                     frame = cv2.resize(frame, (self.resize_x, self.resize_y))
 
+                self.write_video_frame(cv2, frame)
+
                 if not created:
                     cv2.namedWindow(
                         self.window_name,
@@ -640,12 +679,38 @@ class FpvWaypointOverlayDisplay:
                 cv2.imshow(self.window_name, frame)
                 if cv2.waitKey(1) == 27:
                     self.running = False
+                next_frame_at = time.monotonic() + frame_interval_sec
         except Exception as exc:
             self.error = exc
             self.running = False
         finally:
+            if self.video_writer:
+                self.video_writer.release()
+                self.video_writer = None
             if created:
                 cv2.destroyWindow(self.window_name)
+
+    def write_video_frame(self, cv2, frame):
+        if self.video_output_path is None:
+            return
+
+        if self.video_writer is None:
+            height, width = frame.shape[:2]
+            fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+            self.video_writer = cv2.VideoWriter(
+                str(self.video_output_path),
+                fourcc,
+                self.max_fps,
+                (width, height),
+            )
+            if not self.video_writer.isOpened():
+                self.video_writer = None
+                raise RuntimeError(
+                    f"Could not open FPV video writer: {self.video_output_path}"
+                )
+            projectairsim_log().info("Recording FPV video to %s", self.video_output_path)
+
+        self.video_writer.write(frame)
 
     def draw_overlay(self, cv2, frame, image):
         height, width = frame.shape[:2]
@@ -1099,6 +1164,7 @@ async def run_overlay(args):
     cleanup_needed = False
 
     try:
+        video_output_path = prepare_video_output_path(args.video_path)
         temp_config_dir, effective_scene, effective_sim_config_path = (
             make_runtime_scene_config(args, camera_sensor_id)
         )
@@ -1168,6 +1234,8 @@ async def run_overlay(args):
             args.preview_height,
             not args.no_edge_indicators,
             args.waypoint_acceptance_m,
+            args.max_fps,
+            video_output_path,
         )
         display.start()
         client.subscribe(camera_topic, lambda _, image: display.receive(image))
@@ -1357,6 +1425,20 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--preview-width", type=int, default=848)
     parser.add_argument("--preview-height", type=int, default=480)
+    parser.add_argument(
+        "--max-fps",
+        type=float,
+        default=60.0,
+        help="Maximum FPV preview and MP4 recording frame rate.",
+    )
+    parser.add_argument(
+        "--video-path",
+        default="/DroneDigitalTwin/video",
+        help=(
+            "Directory for timestamped FPV MP4 recordings, or an explicit .mp4 "
+            "file path. Use an empty string to disable recording."
+        ),
+    )
     parser.add_argument("--duration-sec", type=float, default=0.0)
     parser.add_argument("--first-frame-timeout-sec", type=float, default=20.0)
     parser.add_argument("--report-every-sec", type=float, default=2.0)
