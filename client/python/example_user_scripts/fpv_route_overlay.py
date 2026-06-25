@@ -853,6 +853,77 @@ async def wait_for_px4_ready(drone: Drone, timeout_sec: float):
     )
 
 
+async def arm_with_retry(drone: Drone, timeout_sec: float):
+    timeout_at = time.time() + timeout_sec
+    attempt = 0
+
+    while time.time() < timeout_at:
+        attempt += 1
+        if not drone.can_arm():
+            projectairsim_log().info("PX4 is not armable yet")
+            await asyncio.sleep(1.0)
+            continue
+
+        projectairsim_log().info("Invoking drone.arm() attempt %d", attempt)
+        if drone.arm():
+            projectairsim_log().info("PX4 armed")
+            return
+
+        projectairsim_log().info("PX4 rejected arm request; retrying")
+        await asyncio.sleep(1.0)
+
+    raise RuntimeError(
+        "PX4 did not arm before timeout. Check the PX4 terminal for health "
+        "failures such as EKF, power, or GPS readiness."
+    )
+
+
+async def await_drone_task(
+    drone: Drone,
+    task: asyncio.Task,
+    label: str,
+    timeout_sec: float,
+    report_interval_sec: float,
+):
+    started_at = time.time()
+    last_report_at = started_at
+
+    while not task.done():
+        now = time.time()
+        elapsed = now - started_at
+        if timeout_sec > 0 and elapsed > timeout_sec:
+            drone.cancel_last_task()
+            position = get_pose_position_ned(drone)
+            raise RuntimeError(
+                f"{label} timed out after {timeout_sec:.1f}s at pose "
+                f"{format_vector3(position)}"
+            )
+
+        if now - last_report_at >= report_interval_sec:
+            position = get_pose_position_ned(drone)
+            projectairsim_log().info(
+                "%s still running after %.1fs; pose NED %s",
+                label,
+                elapsed,
+                format_vector3(position),
+            )
+            last_report_at = now
+
+        await asyncio.sleep(0.25)
+
+    result = await task
+    position = get_pose_position_ned(drone)
+    projectairsim_log().info(
+        "%s completed with result=%s; pose NED %s",
+        label,
+        result,
+        format_vector3(position),
+    )
+    if result is False:
+        raise RuntimeError(f"{label} returned False")
+    return result
+
+
 async def run_overlay(args):
     camera_sensor_id = camera_arg_to_sensor_id(args.camera)
     temp_config_dir = None
@@ -862,6 +933,8 @@ async def run_overlay(args):
         port_services=args.services_port,
     )
     display = None
+    drone = None
+    cleanup_needed = False
 
     try:
         temp_config_dir, effective_scene, effective_sim_config_path = (
@@ -880,9 +953,6 @@ async def run_overlay(args):
             sim_config_path=effective_sim_config_path,
         )
         drone = Drone(client, world, args.drone_name)
-
-        if args.wait_for_px4_ready:
-            await wait_for_px4_ready(drone, args.px4_ready_timeout_sec)
 
         if args.teleport_start:
             if args.start is None:
@@ -936,6 +1006,31 @@ async def run_overlay(args):
         projectairsim_log().info("Subscribed FPV camera topic: %s", camera_topic)
         projectairsim_log().info("Press Esc in the OpenCV window or Ctrl+C to stop")
 
+        if not args.skip_takeoff:
+            await wait_for_px4_ready(drone, args.px4_ready_timeout_sec)
+            before_arming_pose = get_pose_position_ned(drone)
+            projectairsim_log().info(
+                "Before arming pose NED %s",
+                format_vector3(before_arming_pose),
+            )
+
+            if not drone.enable_api_control():
+                raise RuntimeError("Project AirSim did not enable API control")
+            cleanup_needed = True
+            await arm_with_retry(drone, args.arm_timeout_sec)
+
+            projectairsim_log().info("Taking off")
+            takeoff_task = await drone.takeoff_async(timeout_sec=args.takeoff_timeout_sec)
+            await await_drone_task(
+                drone,
+                takeoff_task,
+                "Takeoff",
+                args.takeoff_timeout_sec + 5.0,
+                args.report_every_sec,
+            )
+        elif args.wait_for_px4_ready:
+            await wait_for_px4_ready(drone, args.px4_ready_timeout_sec)
+
         started_at = time.time()
         last_report_at = 0.0
         while args.duration_sec <= 0 or time.time() - started_at < args.duration_sec:
@@ -973,6 +1068,17 @@ async def run_overlay(args):
             )
 
     finally:
+        if cleanup_needed and drone is not None and not args.keep_armed:
+            try:
+                projectairsim_log().info("Cleaning up PX4 control before exit")
+                drone.cancel_last_task()
+                drone.disarm()
+                drone.disable_api_control()
+            except Exception as cleanup_error:
+                projectairsim_log().warning(
+                    "PX4 cleanup failed during script exit: %s",
+                    cleanup_error,
+                )
         if display:
             display.stop()
         if client.state:
@@ -1030,6 +1136,19 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--duration-sec", type=float, default=0.0)
     parser.add_argument("--first-frame-timeout-sec", type=float, default=20.0)
     parser.add_argument("--report-every-sec", type=float, default=2.0)
+    parser.add_argument("--takeoff-timeout-sec", type=float, default=20.0)
+    parser.add_argument("--arm-timeout-sec", type=float, default=60.0)
+    parser.add_argument("--px4-ready-timeout-sec", type=float, default=60.0)
+    parser.add_argument(
+        "--skip-takeoff",
+        action="store_true",
+        help="Only load the scene and show the FPV overlay; do not arm or take off.",
+    )
+    parser.add_argument(
+        "--keep-armed",
+        action="store_true",
+        help="Leave PX4 armed/API control enabled when the overlay exits.",
+    )
     parser.add_argument(
         "--camera-angle-deg",
         "--front-rgb-angle",
@@ -1055,8 +1174,11 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Keep debug point markers until flushed by another script/tool.",
     )
-    parser.add_argument("--wait-for-px4-ready", action="store_true")
-    parser.add_argument("--px4-ready-timeout-sec", type=float, default=60.0)
+    parser.add_argument(
+        "--wait-for-px4-ready",
+        action="store_true",
+        help="Wait for PX4 readiness even when --skip-takeoff is used.",
+    )
     return parser
 
 
