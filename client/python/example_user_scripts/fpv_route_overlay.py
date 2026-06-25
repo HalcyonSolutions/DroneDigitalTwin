@@ -849,14 +849,39 @@ def waypoints_from_path(path: Sequence[Sequence[float]]) -> List[Waypoint]:
     return waypoints
 
 
+def apply_min_altitude(
+    point: Sequence[float],
+    min_altitude_m: float,
+    ground_z_ned: float,
+) -> List[float]:
+    adjusted = [float(point[0]), float(point[1]), float(point[2])]
+    if min_altitude_m <= 0.0:
+        return adjusted
+
+    highest_allowed_down = ground_z_ned - min_altitude_m
+    if adjusted[2] > highest_allowed_down:
+        adjusted[2] = highest_allowed_down
+    return adjusted
+
+
 def plan_astar_route(world: World, args) -> List[List[float]]:
     if args.start is None:
         raise RuntimeError("--goal route planning requires --start")
     if args.goal is None:
         raise RuntimeError("A* route planning requires --goal")
 
-    start = args.start
-    goal = args.goal
+    start = apply_min_altitude(args.start, args.min_altitude, args.ground_z_ned)
+    goal = apply_min_altitude(args.goal, args.min_altitude, args.ground_z_ned)
+    if start != args.start or goal != args.goal:
+        projectairsim_log().info(
+            "Applied --min-altitude %.2fm above ground_z_ned %.2f: "
+            "planning start=%s goal=%s",
+            args.min_altitude,
+            args.ground_z_ned,
+            start,
+            goal,
+        )
+
     map_center = args.map_center or infer_map_center(start, goal)
     map_size = args.map_size or infer_map_size(
         start,
@@ -1346,6 +1371,18 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--map-margin-m", type=float, default=20.0)
     parser.add_argument("--min-map-size-m", type=float, default=50.0)
     parser.add_argument("--ground-z-ned", type=float, default=0.0)
+    parser.add_argument(
+        "--min-altitude",
+        "--min-altitude-m",
+        dest="min_altitude",
+        type=float,
+        default=0.0,
+        help=(
+            "Minimum planned route altitude in meters above --ground-z-ned. "
+            "In NED this clamps waypoint z to ground_z_ned - min_altitude. "
+            "Use 0 to keep requested/planned z values unchanged."
+        ),
+    )
     parser.add_argument(
         "--waypoint-spacing-m",
         "--waypoint-distance-m",
