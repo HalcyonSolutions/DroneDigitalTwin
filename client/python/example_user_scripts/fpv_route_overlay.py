@@ -1346,7 +1346,18 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--map-margin-m", type=float, default=20.0)
     parser.add_argument("--min-map-size-m", type=float, default=50.0)
     parser.add_argument("--ground-z-ned", type=float, default=0.0)
-    parser.add_argument("--waypoint-spacing-m", type=float, default=3.0)
+    parser.add_argument(
+        "--waypoint-spacing-m",
+        "--waypoint-distance-m",
+        dest="waypoint_spacing_m",
+        type=float,
+        default=8.0,
+        help=(
+            "Minimum spacing in meters between planned A* route waypoints after "
+            "sparsifying the dense grid path. Larger values create fewer middle "
+            "waypoints."
+        ),
+    )
     parser.add_argument("--waypoint-acceptance-m", type=float, default=1.0)
     parser.add_argument(
         "--waypoint-hold-sec",
