@@ -23,8 +23,24 @@ from typing import Dict, List, Optional, Sequence, Tuple
 import commentjson
 
 from projectairsim import Drone, ProjectAirSimClient, World
+from projectairsim.planners import AStarPlanner
 from projectairsim.types import Pose, Quaternion, Vector3
-from projectairsim.utils import projectairsim_log, rpy_to_quaternion, unpack_image
+from projectairsim.utils import (
+    calculate_path_length,
+    projectairsim_log,
+    rpy_to_quaternion,
+    unpack_image,
+)
+
+from px4_astar_autopilot import (
+    fly_path_by_velocity,
+    fly_to_point_by_velocity,
+    infer_map_center,
+    infer_map_size,
+    parse_size3,
+    sparsify_path,
+    validate_grid_coordinate,
+)
 
 
 FRIENDLY_CAMERA_IDS = {
@@ -60,7 +76,7 @@ def parse_vector3(value: str) -> List[float]:
 
 def normalize_vector_args(argv: Sequence[str]) -> List[str]:
     normalized = []
-    vector_options = {"--start", "--goal", "--waypoint"}
+    vector_options = {"--start", "--goal", "--waypoint", "--map-center", "--map-size"}
     idx = 0
     while idx < len(argv):
         arg = argv[idx]
@@ -790,6 +806,98 @@ def collect_waypoints(args, drone: Drone) -> List[Waypoint]:
     return waypoints
 
 
+def waypoints_from_path(path: Sequence[Sequence[float]]) -> List[Waypoint]:
+    final_index = len(path) - 1
+    waypoints = []
+    for index, point in enumerate(path):
+        if index == 0:
+            label = "START"
+        elif index == final_index:
+            label = "GOAL"
+        else:
+            label = f"WP{index:03d}"
+        waypoints.append(
+            Waypoint(label, [float(point[0]), float(point[1]), float(point[2])])
+        )
+    return waypoints
+
+
+def plan_astar_route(world: World, args) -> List[List[float]]:
+    if args.start is None:
+        raise RuntimeError("--goal route planning requires --start")
+    if args.goal is None:
+        raise RuntimeError("A* route planning requires --goal")
+
+    start = args.start
+    goal = args.goal
+    map_center = args.map_center or infer_map_center(start, goal)
+    map_size = args.map_size or infer_map_size(
+        start,
+        goal,
+        args.map_margin_m,
+        args.min_map_size_m,
+    )
+    actors_to_ignore = args.ignore_actor or [args.drone_name]
+
+    projectairsim_log().info(
+        "Creating voxel grid: center=%s, size=%s, resolution=%s",
+        map_center,
+        map_size,
+        args.resolution_m,
+    )
+    occupancy_grid = world.create_voxel_grid(
+        make_pose_ned(map_center),
+        map_size[0],
+        map_size[1],
+        map_size[2],
+        args.resolution_m,
+        actors_to_ignore=actors_to_ignore,
+    )
+
+    planner = AStarPlanner(
+        occupancy_grid,
+        map_center,
+        map_size,
+        args.resolution_m,
+        ground_z_ned=args.ground_z_ned,
+    )
+    validate_grid_coordinate(planner, start, "Start")
+    validate_grid_coordinate(planner, goal, "Goal")
+
+    projectairsim_log().info("Planning path from %s to %s", start, goal)
+    dense_path = planner.generate_plan(start, goal)
+    if not dense_path:
+        raise RuntimeError("A* did not find a path")
+
+    path = sparsify_path(dense_path, args.waypoint_spacing_m)
+    projectairsim_log().info(
+        "Planned %d dense points, reduced to %d waypoints, path length %.2f m",
+        len(dense_path),
+        len(path),
+        calculate_path_length(path),
+    )
+    if args.print_waypoints:
+        for index, point in enumerate(path):
+            projectairsim_log().info("Waypoint %03d: %s", index, point)
+    return path
+
+
+def build_route_path(world: World, args, drone: Drone) -> List[List[float]]:
+    if args.goal is not None:
+        return plan_astar_route(world, args)
+
+    manual_waypoints = collect_waypoints(args, drone)
+    if args.waypoint:
+        start = args.start or get_pose_position_ned(drone)
+        path = [start] + [waypoint.position for waypoint in manual_waypoints]
+        if args.print_waypoints:
+            for index, point in enumerate(path):
+                projectairsim_log().info("Waypoint %03d: %s", index, point)
+        return path
+
+    return [waypoint.position for waypoint in manual_waypoints]
+
+
 def plot_world_waypoint_markers(world: World, waypoints: Sequence[Waypoint], args):
     if args.no_world_markers:
         return
@@ -926,6 +1034,8 @@ async def await_drone_task(
 
 async def run_overlay(args):
     camera_sensor_id = camera_arg_to_sensor_id(args.camera)
+    has_explicit_flight_target = bool(args.goal is not None or args.waypoint)
+    route_path = None
     temp_config_dir = None
     client = ProjectAirSimClient(
         address=args.server_ip,
@@ -974,7 +1084,12 @@ async def run_overlay(args):
                 args.camera_angle_deg,
             )
 
-        waypoints = collect_waypoints(args, drone)
+        if has_explicit_flight_target:
+            route_path = build_route_path(world, args, drone)
+            waypoints = waypoints_from_path(route_path)
+        else:
+            waypoints = collect_waypoints(args, drone)
+
         for waypoint in waypoints:
             projectairsim_log().info(
                 "%s NED %s",
@@ -1028,6 +1143,62 @@ async def run_overlay(args):
                 args.takeoff_timeout_sec + 5.0,
                 args.report_every_sec,
             )
+            if has_explicit_flight_target and not args.no_fly_to_waypoint:
+                await fly_to_point_by_velocity(
+                    drone,
+                    route_path[0],
+                    args.velocity_mps,
+                    args.waypoint_acceptance_m,
+                    args.move_timeout_sec,
+                    args.report_every_sec,
+                    args.face_travel_direction,
+                    "Move to start",
+                    args.velocity_command_duration_sec,
+                    args.acceleration_limit_mps2,
+                    args.slowdown_distance_m,
+                    args.path_yaw_rate_dps,
+                    None,
+                    True,
+                    True,
+                    None,
+                    None,
+                )
+                await fly_path_by_velocity(
+                    drone,
+                    route_path,
+                    args.velocity_mps,
+                    args.waypoint_acceptance_m,
+                    args.move_timeout_sec,
+                    args.report_every_sec,
+                    args.face_travel_direction,
+                    args.velocity_command_duration_sec,
+                    args.acceleration_limit_mps2,
+                    args.slowdown_distance_m,
+                    args.waypoint_hold_sec,
+                    args.path_yaw_rate_dps,
+                    None,
+                    None,
+                )
+                projectairsim_log().info(
+                    "Reached destination %s",
+                    args.goal or route_path[-1],
+                )
+                if args.land_at_goal:
+                    projectairsim_log().info("Landing at destination")
+                    land_task = await drone.land_async(timeout_sec=args.land_timeout_sec)
+                    await await_drone_task(
+                        drone,
+                        land_task,
+                        "Landing",
+                        args.land_timeout_sec + 5.0,
+                        args.report_every_sec,
+                    )
+                if not args.keep_overlay_after_mission:
+                    return
+            elif not has_explicit_flight_target:
+                projectairsim_log().info(
+                    "No explicit --goal/--waypoint supplied; holding after takeoff"
+                )
         elif args.wait_for_px4_ready:
             await wait_for_px4_ready(drone, args.px4_ready_timeout_sec)
 
@@ -1137,17 +1308,99 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--first-frame-timeout-sec", type=float, default=20.0)
     parser.add_argument("--report-every-sec", type=float, default=2.0)
     parser.add_argument("--takeoff-timeout-sec", type=float, default=20.0)
+    parser.add_argument("--land-timeout-sec", type=float, default=30.0)
     parser.add_argument("--arm-timeout-sec", type=float, default=60.0)
     parser.add_argument("--px4-ready-timeout-sec", type=float, default=60.0)
+    parser.add_argument("--velocity-mps", type=float, default=2.0)
+    parser.add_argument("--resolution-m", type=float, default=1.0)
+    parser.add_argument("--map-center", type=parse_vector3)
+    parser.add_argument("--map-size", type=parse_size3)
+    parser.add_argument("--map-margin-m", type=float, default=20.0)
+    parser.add_argument("--min-map-size-m", type=float, default=50.0)
+    parser.add_argument("--ground-z-ned", type=float, default=0.0)
+    parser.add_argument("--waypoint-spacing-m", type=float, default=3.0)
+    parser.add_argument("--waypoint-acceptance-m", type=float, default=1.0)
+    parser.add_argument(
+        "--waypoint-hold-sec",
+        type=float,
+        default=0.0,
+        help="Seconds to brake and hover at each intermediate planned waypoint.",
+    )
+    parser.add_argument(
+        "--velocity-command-duration-sec",
+        type=float,
+        default=0.1,
+        help="Duration of each PX4 velocity setpoint while following waypoints.",
+    )
+    parser.add_argument(
+        "--acceleration-limit-mps2",
+        type=float,
+        default=2.0,
+        help="Maximum velocity change rate while following waypoints.",
+    )
+    parser.add_argument(
+        "--slowdown-distance-m",
+        type=float,
+        default=4.0,
+        help="Distance over which velocity mode eases down near each waypoint.",
+    )
+    parser.add_argument(
+        "--path-yaw-rate-dps",
+        type=float,
+        default=15.0,
+        help="Maximum yaw rate used by --face-travel-direction.",
+    )
+    parser.add_argument(
+        "--move-timeout-sec",
+        type=float,
+        default=45.0,
+        help="Per-waypoint movement timeout while following the planned route.",
+    )
+    parser.set_defaults(face_travel_direction=False)
+    parser.add_argument(
+        "--face-travel-direction",
+        dest="face_travel_direction",
+        action="store_true",
+        help="Yaw toward each planned waypoint while flying.",
+    )
+    parser.add_argument(
+        "--no-face-travel-direction",
+        dest="face_travel_direction",
+        action="store_false",
+        help="Keep existing yaw while flying the planned route.",
+    )
     parser.add_argument(
         "--skip-takeoff",
         action="store_true",
         help="Only load the scene and show the FPV overlay; do not arm or take off.",
     )
     parser.add_argument(
+        "--no-fly-to-waypoint",
+        action="store_true",
+        help="Take off and hold while showing waypoint overlays; do not fly the route.",
+    )
+    parser.add_argument(
         "--keep-armed",
         action="store_true",
         help="Leave PX4 armed/API control enabled when the overlay exits.",
+    )
+    parser.set_defaults(land_at_goal=True)
+    parser.add_argument(
+        "--land-at-goal",
+        dest="land_at_goal",
+        action="store_true",
+        help="Land after reaching the final planned waypoint.",
+    )
+    parser.add_argument(
+        "--no-land-at-goal",
+        dest="land_at_goal",
+        action="store_false",
+        help="Hold after reaching the final planned waypoint instead of landing.",
+    )
+    parser.add_argument(
+        "--keep-overlay-after-mission",
+        action="store_true",
+        help="Keep the FPV overlay open after reaching/landing at the goal.",
     )
     parser.add_argument(
         "--camera-angle-deg",
@@ -1169,6 +1422,25 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--world-label-scale", type=float, default=1.0)
     parser.add_argument("--world-label-z-offset-m", type=float, default=1.0)
     parser.add_argument("--world-marker-duration-sec", type=float, default=3600.0)
+    parser.add_argument(
+        "--ignore-actor",
+        action="append",
+        default=None,
+        help="Actor to ignore in the occupancy grid. Repeatable.",
+    )
+    parser.set_defaults(print_waypoints=True)
+    parser.add_argument(
+        "--print-waypoints",
+        dest="print_waypoints",
+        action="store_true",
+        help="Print every planned waypoint.",
+    )
+    parser.add_argument(
+        "--no-print-waypoints",
+        dest="print_waypoints",
+        action="store_false",
+        help="Suppress per-waypoint route logging.",
+    )
     parser.add_argument(
         "--persistent-world-markers",
         action="store_true",
