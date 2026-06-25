@@ -97,6 +97,10 @@ def format_vector3(values: Sequence[float]) -> str:
     return f"[{values[0]:.2f}, {values[1]:.2f}, {values[2]:.2f}]"
 
 
+def distance_between(a: Sequence[float], b: Sequence[float]) -> float:
+    return math.sqrt(sum((a[idx] - b[idx]) ** 2 for idx in range(3)))
+
+
 def parse_float3(value: str) -> List[float]:
     parts = str(value).replace(",", " ").split()
     if len(parts) != 3:
@@ -558,6 +562,7 @@ class FpvWaypointOverlayDisplay:
         resize_x: Optional[int],
         resize_y: Optional[int],
         draw_edge_indicators: bool,
+        reached_distance_m: float,
     ):
         self.window_name = window_name
         self.waypoints = list(waypoints)
@@ -565,6 +570,8 @@ class FpvWaypointOverlayDisplay:
         self.resize_x = resize_x
         self.resize_y = resize_y
         self.draw_edge_indicators = draw_edge_indicators
+        self.reached_distance_m = max(0.1, reached_distance_m)
+        self.reached_waypoints = [False for _ in self.waypoints]
         self.image_queue = queue.SimpleQueue()
         self.buffer_size = 3
         self.running = False
@@ -663,7 +670,8 @@ class FpvWaypointOverlayDisplay:
             cv2.LINE_AA,
         )
 
-        if camera_pose_from_image(image) is None:
+        camera_pose = camera_pose_from_image(image)
+        if camera_pose is None:
             cv2.putText(
                 frame,
                 "camera pose unavailable in image message",
@@ -676,8 +684,27 @@ class FpvWaypointOverlayDisplay:
             )
             return
 
+        camera_position, _ = camera_pose
         status_y = 54
         for index, waypoint in enumerate(self.waypoints):
+            world_distance_m = distance_between(camera_position, waypoint.position)
+            if world_distance_m <= self.reached_distance_m:
+                self.reached_waypoints[index] = True
+
+            if self.reached_waypoints[index]:
+                cv2.putText(
+                    frame,
+                    f"{waypoint.label}: reached",
+                    (12, status_y),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.5,
+                    (0, 220, 0),
+                    2,
+                    cv2.LINE_AA,
+                )
+                status_y += 20
+                continue
+
             projection = project_waypoint(waypoint.position, image, self.fov_degrees)
             if projection is None:
                 cv2.putText(
@@ -1115,6 +1142,7 @@ async def run_overlay(args):
             args.preview_width,
             args.preview_height,
             not args.no_edge_indicators,
+            args.waypoint_acceptance_m,
         )
         display.start()
         client.subscribe(camera_topic, lambda _, image: display.receive(image))
