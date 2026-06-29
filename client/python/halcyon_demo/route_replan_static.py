@@ -131,6 +131,7 @@ def normalize_vector_args(argv: Sequence[str]) -> List[str]:
         "--map-size",
         "--route",
         "--replan-rejoin-point",
+        "--replan-emergency-node",
     }
     idx = 0
     while idx < len(argv):
@@ -1468,6 +1469,56 @@ def find_auto_rejoin_index(
     raise RuntimeError("Could not find a clear downstream route waypoint to rejoin.")
 
 
+def plan_astar_segment(
+    planner: AStarPlanner,
+    start: Sequence[float],
+    goal: Sequence[float],
+    label: str,
+) -> List[List[float]]:
+    validate_grid_coordinate(planner, start, f"{label} start")
+    validate_grid_coordinate(planner, goal, f"{label} goal")
+    dense_path = planner.generate_plan(start, goal)
+    if not dense_path:
+        raise RuntimeError(f"A* did not find a path for {label}")
+    return [
+        [float(point[0]), float(point[1]), float(point[2])]
+        for point in dense_path
+    ]
+
+
+def plan_bypass_path(
+    scan: StaticRouteScan,
+    args,
+    reroute_start: Sequence[float],
+    rejoin_point: Sequence[float],
+) -> List[List[float]]:
+    targets = []
+    if args.replan_emergency_node is not None:
+        targets.append([float(value) for value in args.replan_emergency_node])
+    targets.append([float(value) for value in rejoin_point])
+
+    bypass = []
+    start = [float(value) for value in reroute_start]
+    for index, target in enumerate(targets, start=1):
+        label = (
+            "emergency-node bypass"
+            if index == 1 and args.replan_emergency_node is not None
+            else "route-rejoin bypass"
+        )
+        projectairsim_log().info(
+            "Planning A* %s from %s to %s",
+            label,
+            format_vector3(start),
+            format_vector3(target),
+        )
+        segment = plan_astar_segment(scan.planner, start, target, label)
+        for point in segment:
+            append_unique_point(bypass, point)
+        start = target
+
+    return sparsify_path(bypass, args.replan_waypoint_spacing_m)
+
+
 def build_rerouted_path(
     scan: StaticRouteScan,
     args,
@@ -1495,26 +1546,23 @@ def build_rerouted_path(
     obstacle.rejoin_index = rejoin_index
     obstacle.rejoin_point = rejoin_point
 
-    validate_grid_coordinate(scan.planner, reroute_start, "Reroute start")
-    validate_grid_coordinate(scan.planner, rejoin_point, "Reroute rejoin")
+    if args.replan_emergency_node is not None:
+        projectairsim_log().info(
+            "Reroute will pass through emergency node %s before rejoining route "
+            "waypoint %03d %s.",
+            format_vector3(args.replan_emergency_node),
+            rejoin_index,
+            format_vector3(rejoin_point),
+        )
+    else:
+        projectairsim_log().info(
+            "Planning A* reroute from %s to original route waypoint %03d %s",
+            format_vector3(reroute_start),
+            rejoin_index,
+            format_vector3(rejoin_point),
+        )
 
-    projectairsim_log().info(
-        "Planning A* reroute from %s to original route waypoint %03d %s",
-        format_vector3(reroute_start),
-        rejoin_index,
-        format_vector3(rejoin_point),
-    )
-    dense_bypass = scan.planner.generate_plan(reroute_start, rejoin_point)
-    if not dense_bypass:
-        raise RuntimeError("A* did not find a reroute around the detected object")
-
-    bypass = sparsify_path(
-        [
-            [float(point[0]), float(point[1]), float(point[2])]
-            for point in dense_bypass
-        ],
-        args.replan_waypoint_spacing_m,
-    )
+    bypass = plan_bypass_path(scan, args, reroute_start, rejoin_point)
 
     mission_path = []
     for point in truncate_route_at_distance(path, reroute_start_distance):
@@ -1526,10 +1574,15 @@ def build_rerouted_path(
 
     projectairsim_log().warning(
         "Object on path detected at NED %s. Replaced blocked route segment "
-        "with %d A* bypass waypoint(s), then rejoined the normal route at "
+        "with %d A* bypass waypoint(s)%s, then rejoined the normal route at "
         "waypoint %03d %s.",
         format_vector3(obstacle.obstacle_point),
         len(bypass),
+        (
+            f" via emergency node {format_vector3(args.replan_emergency_node)}"
+            if args.replan_emergency_node is not None
+            else ""
+        ),
         rejoin_index,
         format_vector3(rejoin_point),
     )
@@ -1643,7 +1696,10 @@ async def maybe_replan_active_route(
     )
     obstacle.stop_point = [float(value) for value in current_position]
     obstacle.stop_distance_m = 0.0
-    route_scan = create_static_route_scan(world, args, remaining_path)
+    replan_scan_path = list(remaining_path)
+    if args.replan_emergency_node is not None:
+        append_unique_point(replan_scan_path, args.replan_emergency_node)
+    route_scan = create_static_route_scan(world, args, replan_scan_path)
     rerouted_path = build_rerouted_path(route_scan, args, remaining_path, obstacle)
     if args.dynamic_replan_max_segment_m > 0.0:
         rerouted_path = densify_path(rerouted_path, args.dynamic_replan_max_segment_m)
@@ -2341,8 +2397,17 @@ def build_parser() -> argparse.ArgumentParser:
         type=parse_vector3,
         default=None,
         help=(
-            "Optional explicit original-route waypoint to rejoin after bypassing "
-            "the object, for example \"45,17,-13\"."
+            "Optional explicit downstream point from the original route to rejoin "
+            "after bypassing the object, for example \"45,17,-13\"."
+        ),
+    )
+    parser.add_argument(
+        "--replan-emergency-node",
+        type=parse_vector3,
+        default=None,
+        help=(
+            "Optional free NED waypoint, not required to be in --route, that the "
+            "live reroute must pass through before reconnecting to the normal route."
         ),
     )
     parser.add_argument(
