@@ -65,6 +65,15 @@ class Waypoint:
     position: List[float]
 
 
+@dataclass
+class StaticRouteObstacle:
+    obstacle_point: List[float]
+    stop_point: List[float]
+    route_distance_m: float
+    stop_distance_m: float
+    segment_index: int
+
+
 def parse_vector3(value: str) -> List[float]:
     parts = value.replace(",", " ").split()
     if len(parts) != 3:
@@ -131,6 +140,143 @@ def format_vector3(values: Sequence[float]) -> str:
 
 def distance_between(a: Sequence[float], b: Sequence[float]) -> float:
     return math.sqrt(sum((a[idx] - b[idx]) ** 2 for idx in range(3)))
+
+
+def interpolate_point(
+    a: Sequence[float],
+    b: Sequence[float],
+    fraction: float,
+) -> List[float]:
+    fraction = max(0.0, min(1.0, fraction))
+    return [float(a[idx]) + (float(b[idx]) - float(a[idx])) * fraction for idx in range(3)]
+
+
+def cumulative_route_distances(path: Sequence[Sequence[float]]) -> List[float]:
+    distances = [0.0]
+    for index in range(1, len(path)):
+        distances.append(distances[-1] + distance_between(path[index - 1], path[index]))
+    return distances
+
+
+def point_at_route_distance(
+    path: Sequence[Sequence[float]],
+    target_distance_m: float,
+) -> Tuple[List[float], int]:
+    if not path:
+        raise ValueError("Path must contain at least one point")
+
+    if target_distance_m <= 0.0 or len(path) == 1:
+        return [float(value) for value in path[0]], 0
+
+    traveled = 0.0
+    for index in range(1, len(path)):
+        start = path[index - 1]
+        end = path[index]
+        segment_length = distance_between(start, end)
+        if segment_length <= 1e-6:
+            continue
+        if traveled + segment_length >= target_distance_m:
+            fraction = (target_distance_m - traveled) / segment_length
+            return interpolate_point(start, end, fraction), index - 1
+        traveled += segment_length
+
+    return [float(value) for value in path[-1]], max(0, len(path) - 2)
+
+
+def iter_route_samples(
+    path: Sequence[Sequence[float]],
+    spacing_m: float,
+):
+    spacing_m = max(0.1, spacing_m)
+    total_length = calculate_path_length(path)
+    distance_m = 0.0
+    while distance_m < total_length:
+        point, segment_index = point_at_route_distance(path, distance_m)
+        yield distance_m, point, segment_index
+        distance_m += spacing_m
+    point, segment_index = point_at_route_distance(path, total_length)
+    yield total_length, point, segment_index
+
+
+def truncate_route_at_distance(
+    path: Sequence[Sequence[float]],
+    target_distance_m: float,
+) -> List[List[float]]:
+    target_point, _ = point_at_route_distance(path, target_distance_m)
+    if len(path) <= 1:
+        return [target_point]
+
+    truncated = [[float(value) for value in path[0]]]
+    traveled = 0.0
+    for index in range(1, len(path)):
+        start = path[index - 1]
+        end = path[index]
+        segment_length = distance_between(start, end)
+        if segment_length <= 1e-6:
+            continue
+        next_distance = traveled + segment_length
+        if next_distance < target_distance_m:
+            truncated.append([float(value) for value in end])
+            traveled = next_distance
+            continue
+        if distance_between(truncated[-1], target_point) > 1e-3:
+            truncated.append(target_point)
+        return truncated
+
+    if distance_between(truncated[-1], target_point) > 1e-3:
+        truncated.append(target_point)
+    return truncated
+
+
+def route_scan_volume(
+    path: Sequence[Sequence[float]],
+    margin_m: float,
+    min_size_m: float,
+    resolution_m: float,
+) -> Tuple[List[float], List[float]]:
+    margin_m = max(0.0, margin_m)
+    min_size_m = max(resolution_m, min_size_m)
+    resolution_m = max(0.1, resolution_m)
+    center = []
+    size = []
+    for axis in range(3):
+        values = [point[axis] for point in path]
+        axis_min = min(values) - margin_m
+        axis_max = max(values) + margin_m
+        axis_size = max(min_size_m, axis_max - axis_min)
+        axis_size = math.ceil(axis_size / resolution_m) * resolution_m
+        center.append((axis_min + axis_max) * 0.5)
+        size.append(axis_size)
+    return center, size
+
+
+def horizontal_offsets(radius_m: float, resolution_m: float) -> List[Tuple[float, float]]:
+    if radius_m <= 0.0:
+        return [(0.0, 0.0)]
+
+    step = max(0.25, min(radius_m, resolution_m))
+    offsets = [(0.0, 0.0)]
+    cells = max(1, math.ceil(radius_m / step))
+    for x_index in range(-cells, cells + 1):
+        for y_index in range(-cells, cells + 1):
+            dx = x_index * step
+            dy = y_index * step
+            if dx == 0.0 and dy == 0.0:
+                continue
+            if math.hypot(dx, dy) <= radius_m + 1e-6:
+                offsets.append((dx, dy))
+    return offsets
+
+
+def is_route_corridor_clear(planner: AStarPlanner, point: Sequence[float], args) -> bool:
+    for dx, dy in horizontal_offsets(
+        args.object_path_clearance_m,
+        args.object_scan_resolution_m,
+    ):
+        candidate = [point[0] + dx, point[1] + dy, point[2]]
+        if not planner.check_coordinate_validity(candidate, is_NED=True):
+            return False
+    return True
 
 
 def parse_float3(value: str) -> List[float]:
@@ -931,14 +1077,17 @@ def collect_waypoints(args, drone: Drone) -> List[Waypoint]:
     return waypoints
 
 
-def waypoints_from_path(path: Sequence[Sequence[float]]) -> List[Waypoint]:
+def waypoints_from_path(
+    path: Sequence[Sequence[float]],
+    final_label: str = "END",
+) -> List[Waypoint]:
     final_index = len(path) - 1
     waypoints = []
     for index, point in enumerate(path):
         if index == 0:
             label = "START"
         elif index == final_index:
-            label = "END"
+            label = final_label
         else:
             label = f"WP{index:03d}"
         waypoints.append(
@@ -1058,6 +1207,82 @@ def build_route_path(world: World, args, drone: Drone) -> List[List[float]]:
         for index, point in enumerate(path):
             projectairsim_log().info("Route point %03d: %s", index, point)
     return path
+
+
+def find_static_route_obstacle(
+    world: World,
+    args,
+    path: Sequence[Sequence[float]],
+) -> Optional[StaticRouteObstacle]:
+    if not args.stop_on_object or len(path) < 2:
+        return None
+
+    projectairsim_log().info(
+        "Project AirSim does not provide a general trained tree detector here; "
+        "using simulator voxel occupancy to detect static objects on the route."
+    )
+
+    resolution_m = max(0.1, args.object_scan_resolution_m)
+    scan_margin_m = max(
+        args.object_scan_margin_m,
+        args.object_path_clearance_m + (2.0 * resolution_m),
+    )
+    map_center, map_size = route_scan_volume(
+        path,
+        scan_margin_m,
+        args.object_scan_min_size_m,
+        resolution_m,
+    )
+    actors_to_ignore = list(args.ignore_actor or [])
+    if args.drone_name not in actors_to_ignore:
+        actors_to_ignore.append(args.drone_name)
+
+    projectairsim_log().info(
+        "Scanning route corridor for static objects: center=%s size=%s "
+        "resolution=%.2fm clearance=%.2fm",
+        format_vector3(map_center),
+        format_vector3(map_size),
+        resolution_m,
+        args.object_path_clearance_m,
+    )
+    occupancy_grid = world.create_voxel_grid(
+        make_pose_ned(map_center),
+        map_size[0],
+        map_size[1],
+        map_size[2],
+        resolution_m,
+        actors_to_ignore=actors_to_ignore,
+    )
+    planner = AStarPlanner(
+        occupancy_grid,
+        map_center,
+        map_size,
+        resolution_m,
+        ground_z_ned=args.ground_z_ned,
+    )
+
+    start_ignore_m = max(0.0, args.object_scan_start_ignore_m)
+    for distance_m, point, segment_index in iter_route_samples(
+        path,
+        args.object_scan_sample_spacing_m,
+    ):
+        if distance_m < start_ignore_m:
+            continue
+        if is_route_corridor_clear(planner, point, args):
+            continue
+
+        stop_distance_m = max(0.0, distance_m - args.object_stop_distance_m)
+        stop_point, _ = point_at_route_distance(path, stop_distance_m)
+        return StaticRouteObstacle(
+            obstacle_point=point,
+            stop_point=stop_point,
+            route_distance_m=distance_m,
+            stop_distance_m=stop_distance_m,
+            segment_index=segment_index,
+        )
+
+    projectairsim_log().info("No static object detected on the supplied route corridor")
+    return None
 
 
 def plot_world_waypoint_markers(world: World, waypoints: Sequence[Waypoint], args):
@@ -1202,6 +1427,8 @@ async def run_overlay(args):
         args.route or args.goal is not None or args.waypoint
     )
     route_path = None
+    mission_path = None
+    static_obstacle = None
     temp_config_dir = None
     client = ProjectAirSimClient(
         address=args.server_ip,
@@ -1253,7 +1480,27 @@ async def run_overlay(args):
 
         if has_explicit_flight_target:
             route_path = build_route_path(world, args, drone)
-            waypoints = waypoints_from_path(route_path)
+            mission_path = route_path
+            static_obstacle = find_static_route_obstacle(world, args, route_path)
+            if static_obstacle:
+                mission_path = truncate_route_at_distance(
+                    route_path,
+                    static_obstacle.stop_distance_m,
+                )
+                projectairsim_log().warning(
+                    "Object on path detected at NED %s on segment %d, %.2fm "
+                    "from route start. Drone will stop %.2fm before it at NED %s, "
+                    "land, and stop the mission.",
+                    format_vector3(static_obstacle.obstacle_point),
+                    static_obstacle.segment_index,
+                    static_obstacle.route_distance_m,
+                    args.object_stop_distance_m,
+                    format_vector3(static_obstacle.stop_point),
+                )
+            waypoints = waypoints_from_path(
+                mission_path,
+                final_label="STOP" if static_obstacle else "END",
+            )
         else:
             waypoints = collect_waypoints(args, drone)
 
@@ -1316,7 +1563,7 @@ async def run_overlay(args):
             if has_explicit_flight_target and not args.no_fly_to_waypoint:
                 await fly_to_point_by_velocity(
                     drone,
-                    route_path[0],
+                    mission_path[0],
                     args.velocity_mps,
                     args.waypoint_acceptance_m,
                     args.move_timeout_sec,
@@ -1335,7 +1582,7 @@ async def run_overlay(args):
                 )
                 await fly_path_by_velocity(
                     drone,
-                    route_path,
+                    mission_path,
                     args.velocity_mps,
                     args.waypoint_acceptance_m,
                     args.move_timeout_sec,
@@ -1349,9 +1596,24 @@ async def run_overlay(args):
                     None,
                     None,
                 )
+                if static_obstacle:
+                    projectairsim_log().warning(
+                        "Object on the path detected. Stopped at NED %s; "
+                        "landing and stopping the mission.",
+                        format_vector3(static_obstacle.stop_point),
+                    )
+                    land_task = await drone.land_async(timeout_sec=args.land_timeout_sec)
+                    await await_drone_task(
+                        drone,
+                        land_task,
+                        "Object stop landing",
+                        args.land_timeout_sec + 5.0,
+                        args.report_every_sec,
+                    )
+                    return
                 projectairsim_log().info(
                     "Reached route destination %s",
-                    route_path[-1],
+                    mission_path[-1],
                 )
                 if args.land_at_goal:
                     projectairsim_log().info("Landing at destination")
@@ -1519,6 +1781,64 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--map-margin-m", type=float, default=20.0)
     parser.add_argument("--min-map-size-m", type=float, default=50.0)
     parser.add_argument("--ground-z-ned", type=float, default=0.0)
+    parser.set_defaults(stop_on_object=True)
+    parser.add_argument(
+        "--stop-on-object",
+        dest="stop_on_object",
+        action="store_true",
+        help=(
+            "Scan the supplied route for static objects, stop before the first "
+            "blocked route point, land, and end the mission. Enabled by default."
+        ),
+    )
+    parser.add_argument(
+        "--no-stop-on-object",
+        dest="stop_on_object",
+        action="store_false",
+        help="Disable the static object stop/land check.",
+    )
+    parser.add_argument(
+        "--object-stop-distance-m",
+        type=float,
+        default=2.0,
+        help="Distance before the first blocked route point where the drone stops.",
+    )
+    parser.add_argument(
+        "--object-path-clearance-m",
+        type=float,
+        default=1.0,
+        help="Horizontal route corridor radius to treat as blocked by objects.",
+    )
+    parser.add_argument(
+        "--object-scan-resolution-m",
+        type=float,
+        default=1.0,
+        help="Voxel-grid resolution for static object route scanning.",
+    )
+    parser.add_argument(
+        "--object-scan-sample-spacing-m",
+        type=float,
+        default=0.5,
+        help="Spacing between route samples checked for static object occupancy.",
+    )
+    parser.add_argument(
+        "--object-scan-margin-m",
+        type=float,
+        default=4.0,
+        help="Extra meters added around the route when creating the scan grid.",
+    )
+    parser.add_argument(
+        "--object-scan-min-size-m",
+        type=float,
+        default=10.0,
+        help="Minimum x/y/z size for the static object scan grid.",
+    )
+    parser.add_argument(
+        "--object-scan-start-ignore-m",
+        type=float,
+        default=1.0,
+        help="Ignore occupied samples this close to the route start.",
+    )
     parser.add_argument(
         "--min-altitude",
         "--min-altitude-m",
