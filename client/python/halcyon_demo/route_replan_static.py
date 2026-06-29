@@ -1,9 +1,10 @@
 """
-Manual route-following baseline for a PX4-style Project AirSim drone.
+Manual route following with live static-obstacle rerouting for a PX4-style drone.
 
 The user provides a route as [START, NED1, NED2, ..., END], and the drone
-follows those points in order. Obstacle detection and A* segment replacement
-will be added after this baseline is working.
+follows those points in order. While flying, it scans a short lookahead window
+for occupied objects on the route; if one is found, A* replaces the blocked
+segment and rejoins the original downstream route.
 """
 
 import argparse
@@ -38,8 +39,10 @@ sys.path.append(
 )
 
 from px4_astar_autopilot import (
+    brake_to_stop_by_velocity,
     fly_path_by_velocity,
     fly_to_point_by_velocity,
+    hold_waypoint_by_velocity,
     infer_map_center,
     infer_map_size,
     parse_size3,
@@ -72,6 +75,16 @@ class StaticRouteObstacle:
     route_distance_m: float
     stop_distance_m: float
     segment_index: int
+    rejoin_index: Optional[int] = None
+    rejoin_point: Optional[List[float]] = None
+
+
+@dataclass
+class StaticRouteScan:
+    planner: AStarPlanner
+    map_center: List[float]
+    map_size: List[float]
+    resolution_m: float
 
 
 def parse_vector3(value: str) -> List[float]:
@@ -117,6 +130,7 @@ def normalize_vector_args(argv: Sequence[str]) -> List[str]:
         "--map-center",
         "--map-size",
         "--route",
+        "--replan-rejoin-point",
     }
     idx = 0
     while idx < len(argv):
@@ -226,6 +240,48 @@ def truncate_route_at_distance(
     if distance_between(truncated[-1], target_point) > 1e-3:
         truncated.append(target_point)
     return truncated
+
+
+def append_unique_point(
+    path: List[List[float]],
+    point: Sequence[float],
+    min_distance_m: float = 1e-3,
+) -> None:
+    candidate = [float(point[0]), float(point[1]), float(point[2])]
+    if not path or distance_between(path[-1], candidate) > min_distance_m:
+        path.append(candidate)
+
+
+def densify_path(
+    path: Sequence[Sequence[float]],
+    max_spacing_m: float,
+) -> List[List[float]]:
+    if len(path) <= 1 or max_spacing_m <= 0.0:
+        return [[float(point[0]), float(point[1]), float(point[2])] for point in path]
+
+    dense_path = [[float(path[0][0]), float(path[0][1]), float(path[0][2])]]
+    for index in range(1, len(path)):
+        start = path[index - 1]
+        end = path[index]
+        segment_length = distance_between(start, end)
+        steps = max(1, math.ceil(segment_length / max_spacing_m))
+        for step in range(1, steps + 1):
+            append_unique_point(dense_path, interpolate_point(start, end, step / steps))
+    return dense_path
+
+
+def route_waypoint_index_at_distance(
+    path: Sequence[Sequence[float]],
+    distance_m: float,
+    minimum_index: int = 0,
+) -> int:
+    route_distances = cumulative_route_distances(path)
+    for index, route_distance_m in enumerate(route_distances):
+        if index < minimum_index:
+            continue
+        if route_distance_m >= distance_m:
+            return index
+    return len(path) - 1
 
 
 def route_scan_volume(
@@ -806,6 +862,10 @@ class FpvWaypointOverlayDisplay:
             self.image_queue.get()
         self.image_queue.put(image)
 
+    def set_waypoints(self, waypoints: Sequence[Waypoint]) -> None:
+        self.waypoints = list(waypoints)
+        self.reached_waypoints = [False for _ in self.waypoints]
+
     def display_loop(self):
         import cv2
 
@@ -1209,22 +1269,21 @@ def build_route_path(world: World, args, drone: Drone) -> List[List[float]]:
     return path
 
 
-def find_static_route_obstacle(
+def create_static_route_scan(
     world: World,
     args,
     path: Sequence[Sequence[float]],
-) -> Optional[StaticRouteObstacle]:
-    if not args.stop_on_object or len(path) < 2:
-        return None
-
-    projectairsim_log().info(
-        "Project AirSim does not provide a general trained tree detector here; "
-        "using simulator voxel occupancy to detect static objects on the route."
-    )
-
+    log_scan: bool = True,
+    margin_override_m: Optional[float] = None,
+) -> StaticRouteScan:
     resolution_m = max(0.1, args.object_scan_resolution_m)
+    scan_margin_base_m = (
+        args.object_scan_margin_m
+        if margin_override_m is None
+        else margin_override_m
+    )
     scan_margin_m = max(
-        args.object_scan_margin_m,
+        scan_margin_base_m,
         args.object_path_clearance_m + (2.0 * resolution_m),
     )
     map_center, map_size = route_scan_volume(
@@ -1237,14 +1296,15 @@ def find_static_route_obstacle(
     if args.drone_name not in actors_to_ignore:
         actors_to_ignore.append(args.drone_name)
 
-    projectairsim_log().info(
-        "Scanning route corridor for static objects: center=%s size=%s "
-        "resolution=%.2fm clearance=%.2fm",
-        format_vector3(map_center),
-        format_vector3(map_size),
-        resolution_m,
-        args.object_path_clearance_m,
-    )
+    if log_scan:
+        projectairsim_log().info(
+            "Scanning route corridor for static objects: center=%s size=%s "
+            "resolution=%.2fm clearance=%.2fm",
+            format_vector3(map_center),
+            format_vector3(map_size),
+            resolution_m,
+            args.object_path_clearance_m,
+        )
     occupancy_grid = world.create_voxel_grid(
         make_pose_ned(map_center),
         map_size[0],
@@ -1260,6 +1320,17 @@ def find_static_route_obstacle(
         resolution_m,
         ground_z_ned=args.ground_z_ned,
     )
+    return StaticRouteScan(planner, map_center, map_size, resolution_m)
+
+
+def find_static_route_obstacle(
+    scan: StaticRouteScan,
+    args,
+    path: Sequence[Sequence[float]],
+    log_clear: bool = True,
+) -> Optional[StaticRouteObstacle]:
+    if not args.replan_on_object or len(path) < 2:
+        return None
 
     start_ignore_m = max(0.0, args.object_scan_start_ignore_m)
     for distance_m, point, segment_index in iter_route_samples(
@@ -1268,7 +1339,7 @@ def find_static_route_obstacle(
     ):
         if distance_m < start_ignore_m:
             continue
-        if is_route_corridor_clear(planner, point, args):
+        if is_route_corridor_clear(scan.planner, point, args):
             continue
 
         stop_distance_m = max(0.0, distance_m - args.object_stop_distance_m)
@@ -1281,8 +1352,373 @@ def find_static_route_obstacle(
             segment_index=segment_index,
         )
 
-    projectairsim_log().info("No static object detected on the supplied route corridor")
+    if log_clear:
+        projectairsim_log().info("No static object detected on the supplied route corridor")
     return None
+
+
+def find_clear_reroute_start(
+    scan: StaticRouteScan,
+    args,
+    path: Sequence[Sequence[float]],
+    target_distance_m: float,
+) -> Tuple[List[float], float]:
+    spacing_m = max(0.1, args.object_scan_sample_spacing_m)
+    distance_m = max(0.0, target_distance_m)
+    while distance_m >= 0.0:
+        point, _ = point_at_route_distance(path, distance_m)
+        if is_route_corridor_clear(scan.planner, point, args):
+            return point, distance_m
+        distance_m -= spacing_m
+
+    start = [float(value) for value in path[0]]
+    if is_route_corridor_clear(scan.planner, start, args):
+        return start, 0.0
+    raise RuntimeError(
+        "Could not find a clear route point before the detected object to start "
+        "the reroute."
+    )
+
+
+def find_explicit_rejoin_index(
+    args,
+    path: Sequence[Sequence[float]],
+    minimum_index: int,
+) -> Optional[int]:
+    if args.replan_rejoin_point is None:
+        return None
+
+    best_index = None
+    best_distance = math.inf
+    for index in range(max(0, minimum_index), len(path)):
+        distance_m = distance_between(path[index], args.replan_rejoin_point)
+        if distance_m < best_distance:
+            best_index = index
+            best_distance = distance_m
+
+    if best_index is None or best_distance > args.replan_rejoin_tolerance_m:
+        raise RuntimeError(
+            "--replan-rejoin-point was not found in the remaining route within "
+            f"{args.replan_rejoin_tolerance_m:.2f}m"
+        )
+    return best_index
+
+
+def find_auto_rejoin_index(
+    scan: StaticRouteScan,
+    args,
+    path: Sequence[Sequence[float]],
+    obstacle: StaticRouteObstacle,
+) -> int:
+    minimum_index = min(
+        len(path) - 1,
+        obstacle.segment_index + max(1, args.replan_rejoin_waypoints_ahead) + 1,
+    )
+    explicit_index = find_explicit_rejoin_index(
+        args,
+        path,
+        obstacle.segment_index + 1,
+    )
+    if explicit_index is not None:
+        return explicit_index
+
+    if is_route_corridor_clear(scan.planner, path[minimum_index], args):
+        return minimum_index
+
+    minimum_distance_m = (
+        obstacle.route_distance_m
+        + max(0.0, args.replan_rejoin_after_obstacle_m)
+    )
+    clear_started_at = None
+    for distance_m, point, _ in iter_route_samples(
+        path,
+        args.object_scan_sample_spacing_m,
+    ):
+        if distance_m <= obstacle.route_distance_m:
+            continue
+
+        if is_route_corridor_clear(scan.planner, point, args):
+            if clear_started_at is None:
+                clear_started_at = distance_m
+            has_clear_run = (
+                distance_m - clear_started_at >= args.replan_rejoin_clear_distance_m
+            )
+            if distance_m >= minimum_distance_m and has_clear_run:
+                candidate_index = route_waypoint_index_at_distance(
+                    path,
+                    distance_m,
+                    minimum_index,
+                )
+                while candidate_index < len(path):
+                    if is_route_corridor_clear(
+                        scan.planner,
+                        path[candidate_index],
+                        args,
+                    ):
+                        return candidate_index
+                    candidate_index += 1
+                break
+        else:
+            clear_started_at = None
+
+    for index in range(minimum_index, len(path)):
+        if is_route_corridor_clear(scan.planner, path[index], args):
+            return index
+
+    raise RuntimeError("Could not find a clear downstream route waypoint to rejoin.")
+
+
+def build_rerouted_path(
+    scan: StaticRouteScan,
+    args,
+    path: Sequence[Sequence[float]],
+    obstacle: StaticRouteObstacle,
+) -> List[List[float]]:
+    reroute_start, reroute_start_distance = find_clear_reroute_start(
+        scan,
+        args,
+        path,
+        obstacle.stop_distance_m,
+    )
+    if distance_between(reroute_start, obstacle.stop_point) > 1e-3:
+        projectairsim_log().warning(
+            "Requested %.2fm stop-before-object point was not clear; reroute "
+            "will start at NED %s instead.",
+            args.object_stop_distance_m,
+            format_vector3(reroute_start),
+        )
+        obstacle.stop_point = reroute_start
+        obstacle.stop_distance_m = reroute_start_distance
+
+    rejoin_index = find_auto_rejoin_index(scan, args, path, obstacle)
+    rejoin_point = [float(value) for value in path[rejoin_index]]
+    obstacle.rejoin_index = rejoin_index
+    obstacle.rejoin_point = rejoin_point
+
+    validate_grid_coordinate(scan.planner, reroute_start, "Reroute start")
+    validate_grid_coordinate(scan.planner, rejoin_point, "Reroute rejoin")
+
+    projectairsim_log().info(
+        "Planning A* reroute from %s to original route waypoint %03d %s",
+        format_vector3(reroute_start),
+        rejoin_index,
+        format_vector3(rejoin_point),
+    )
+    dense_bypass = scan.planner.generate_plan(reroute_start, rejoin_point)
+    if not dense_bypass:
+        raise RuntimeError("A* did not find a reroute around the detected object")
+
+    bypass = sparsify_path(
+        [
+            [float(point[0]), float(point[1]), float(point[2])]
+            for point in dense_bypass
+        ],
+        args.replan_waypoint_spacing_m,
+    )
+
+    mission_path = []
+    for point in truncate_route_at_distance(path, reroute_start_distance):
+        append_unique_point(mission_path, point)
+    for point in bypass:
+        append_unique_point(mission_path, point)
+    for point in path[rejoin_index + 1 :]:
+        append_unique_point(mission_path, point)
+
+    projectairsim_log().warning(
+        "Object on path detected at NED %s. Replaced blocked route segment "
+        "with %d A* bypass waypoint(s), then rejoined the normal route at "
+        "waypoint %03d %s.",
+        format_vector3(obstacle.obstacle_point),
+        len(bypass),
+        rejoin_index,
+        format_vector3(rejoin_point),
+    )
+    return mission_path
+
+
+def remaining_route_from_current(
+    active_path: Sequence[Sequence[float]],
+    waypoint_index: int,
+    current_position: Sequence[float],
+) -> List[List[float]]:
+    remaining_path = []
+    append_unique_point(remaining_path, current_position)
+    for point in active_path[waypoint_index:]:
+        append_unique_point(remaining_path, point)
+    return remaining_path
+
+
+def lookahead_route_from_current(
+    active_path: Sequence[Sequence[float]],
+    waypoint_index: int,
+    current_position: Sequence[float],
+    lookahead_waypoints: int,
+) -> List[List[float]]:
+    lookahead_path = []
+    append_unique_point(lookahead_path, current_position)
+    end_index = min(
+        len(active_path),
+        waypoint_index + max(1, lookahead_waypoints),
+    )
+    for point in active_path[waypoint_index:end_index]:
+        append_unique_point(lookahead_path, point)
+    return lookahead_path
+
+
+def refresh_dynamic_route_visuals(
+    world: World,
+    display: Optional[FpvWaypointOverlayDisplay],
+    active_path: Sequence[Sequence[float]],
+    args,
+) -> None:
+    waypoints = waypoints_from_path(active_path)
+    if display:
+        display.set_waypoints(waypoints)
+    plot_world_waypoint_markers(world, waypoints, args)
+
+
+async def maybe_replan_active_route(
+    world: World,
+    drone: Drone,
+    args,
+    active_path: Sequence[Sequence[float]],
+    waypoint_index: int,
+    current_position: Sequence[float],
+    commanded_velocity: Sequence[float],
+) -> Tuple[List[List[float]], int, Optional[StaticRouteObstacle], List[float]]:
+    lookahead_path = lookahead_route_from_current(
+        active_path,
+        waypoint_index,
+        current_position,
+        args.dynamic_replan_lookahead_waypoints,
+    )
+    if len(lookahead_path) < 2:
+        return list(active_path), waypoint_index, None, list(commanded_velocity)
+
+    lookahead_scan = create_static_route_scan(
+        world,
+        args,
+        lookahead_path,
+        log_scan=False,
+        margin_override_m=args.dynamic_replan_detection_margin_m,
+    )
+    obstacle = find_static_route_obstacle(
+        lookahead_scan,
+        args,
+        lookahead_path,
+        log_clear=False,
+    )
+    if obstacle is None:
+        return list(active_path), waypoint_index, None, list(commanded_velocity)
+
+    projectairsim_log().warning(
+        "Object on path detected on the next route leg at NED %s. Stopping "
+        "before live replanning.",
+        format_vector3(obstacle.obstacle_point),
+    )
+    command_duration_sec = max(0.05, args.velocity_command_duration_sec)
+    max_velocity_delta = max(0.0, args.acceleration_limit_mps2) * command_duration_sec
+    commanded_velocity = await brake_to_stop_by_velocity(
+        drone,
+        commanded_velocity,
+        command_duration_sec,
+        max_velocity_delta,
+    )
+    if args.dynamic_replan_stop_hold_sec > 0.0:
+        await hold_waypoint_by_velocity(
+            drone,
+            args.dynamic_replan_stop_hold_sec,
+            command_duration_sec,
+            "Dynamic replan stop",
+            None,
+            None,
+        )
+
+    current_position = get_pose_position_ned(drone)
+
+    remaining_path = remaining_route_from_current(
+        active_path,
+        waypoint_index,
+        current_position,
+    )
+    obstacle.stop_point = [float(value) for value in current_position]
+    obstacle.stop_distance_m = 0.0
+    route_scan = create_static_route_scan(world, args, remaining_path)
+    rerouted_path = build_rerouted_path(route_scan, args, remaining_path, obstacle)
+    if args.dynamic_replan_max_segment_m > 0.0:
+        rerouted_path = densify_path(rerouted_path, args.dynamic_replan_max_segment_m)
+    return rerouted_path, 1, obstacle, commanded_velocity
+
+
+async def fly_path_with_dynamic_replanning(
+    world: World,
+    drone: Drone,
+    path: List[List[float]],
+    args,
+    display: Optional[FpvWaypointOverlayDisplay] = None,
+) -> Tuple[List[List[float]], int]:
+    active_path = (
+        densify_path(path, args.dynamic_replan_max_segment_m)
+        if args.dynamic_replan_max_segment_m > 0.0
+        else [[float(point[0]), float(point[1]), float(point[2])] for point in path]
+    )
+    waypoint_index = 1
+    commanded_velocity = [0.0, 0.0, 0.0]
+    replan_count = 0
+
+    while waypoint_index < len(active_path):
+        current = get_pose_position_ned(drone)
+        if args.replan_on_object and replan_count < args.dynamic_replan_max_count:
+            new_path, new_index, obstacle, commanded_velocity = await maybe_replan_active_route(
+                world,
+                drone,
+                args,
+                active_path,
+                waypoint_index,
+                current,
+                commanded_velocity,
+            )
+            if obstacle is not None:
+                replan_count += 1
+                active_path = new_path
+                waypoint_index = new_index
+                refresh_dynamic_route_visuals(world, display, active_path, args)
+                projectairsim_log().warning(
+                    "Dynamic reroute %d/%d built while flying. Continuing via "
+                    "%d active waypoint(s).",
+                    replan_count,
+                    args.dynamic_replan_max_count,
+                    len(active_path),
+                )
+                continue
+
+        target = active_path[waypoint_index]
+        is_final_waypoint = waypoint_index == len(active_path) - 1
+        should_hold = args.waypoint_hold_sec > 0.0 and not is_final_waypoint
+        commanded_velocity = await fly_to_point_by_velocity(
+            drone,
+            target,
+            args.velocity_mps,
+            args.waypoint_acceptance_m,
+            args.move_timeout_sec,
+            args.report_every_sec,
+            args.face_travel_direction,
+            f"Waypoint {waypoint_index:03d}",
+            args.velocity_command_duration_sec,
+            args.acceleration_limit_mps2,
+            args.slowdown_distance_m,
+            args.path_yaw_rate_dps,
+            commanded_velocity,
+            is_final_waypoint or should_hold,
+            False,
+            None,
+            None,
+        )
+        if should_hold:
+            await asyncio.sleep(args.waypoint_hold_sec)
+        waypoint_index += 1
+
+    return active_path, replan_count
 
 
 def plot_world_waypoint_markers(world: World, waypoints: Sequence[Waypoint], args):
@@ -1428,7 +1864,6 @@ async def run_overlay(args):
     )
     route_path = None
     mission_path = None
-    static_obstacle = None
     temp_config_dir = None
     client = ProjectAirSimClient(
         address=args.server_ip,
@@ -1481,25 +1916,9 @@ async def run_overlay(args):
         if has_explicit_flight_target:
             route_path = build_route_path(world, args, drone)
             mission_path = route_path
-            static_obstacle = find_static_route_obstacle(world, args, route_path)
-            if static_obstacle:
-                mission_path = truncate_route_at_distance(
-                    route_path,
-                    static_obstacle.stop_distance_m,
-                )
-                projectairsim_log().warning(
-                    "Object on path detected at NED %s on segment %d, %.2fm "
-                    "from route start. Drone will stop %.2fm before it at NED %s, "
-                    "land, and stop the mission.",
-                    format_vector3(static_obstacle.obstacle_point),
-                    static_obstacle.segment_index,
-                    static_obstacle.route_distance_m,
-                    args.object_stop_distance_m,
-                    format_vector3(static_obstacle.stop_point),
-                )
             waypoints = waypoints_from_path(
                 mission_path,
-                final_label="STOP" if static_obstacle else "END",
+                final_label="END",
             )
         else:
             waypoints = collect_waypoints(args, drone)
@@ -1580,37 +1999,41 @@ async def run_overlay(args):
                     None,
                     None,
                 )
-                await fly_path_by_velocity(
-                    drone,
-                    mission_path,
-                    args.velocity_mps,
-                    args.waypoint_acceptance_m,
-                    args.move_timeout_sec,
-                    args.report_every_sec,
-                    args.face_travel_direction,
-                    args.velocity_command_duration_sec,
-                    args.acceleration_limit_mps2,
-                    args.slowdown_distance_m,
-                    args.waypoint_hold_sec,
-                    args.path_yaw_rate_dps,
-                    None,
-                    None,
-                )
-                if static_obstacle:
-                    projectairsim_log().warning(
-                        "Object on the path detected. Stopped at NED %s; "
-                        "landing and stopping the mission.",
-                        format_vector3(static_obstacle.stop_point),
+                if args.replan_on_object:
+                    projectairsim_log().info(
+                        "Dynamic route replanning is enabled. The drone will "
+                        "scan ahead while flying and splice in an A* bypass if "
+                        "the route is blocked."
                     )
-                    land_task = await drone.land_async(timeout_sec=args.land_timeout_sec)
-                    await await_drone_task(
+                    mission_path, replan_count = await fly_path_with_dynamic_replanning(
+                        world,
                         drone,
-                        land_task,
-                        "Object stop landing",
-                        args.land_timeout_sec + 5.0,
-                        args.report_every_sec,
+                        mission_path,
+                        args,
+                        display,
                     )
-                    return
+                    if replan_count:
+                        projectairsim_log().info(
+                            "Completed mission with %d dynamic reroute(s).",
+                            replan_count,
+                        )
+                else:
+                    await fly_path_by_velocity(
+                        drone,
+                        mission_path,
+                        args.velocity_mps,
+                        args.waypoint_acceptance_m,
+                        args.move_timeout_sec,
+                        args.report_every_sec,
+                        args.face_travel_direction,
+                        args.velocity_command_duration_sec,
+                        args.acceleration_limit_mps2,
+                        args.slowdown_distance_m,
+                        args.waypoint_hold_sec,
+                        args.path_yaw_rate_dps,
+                        None,
+                        None,
+                    )
                 projectairsim_log().info(
                     "Reached route destination %s",
                     mission_path[-1],
@@ -1781,27 +2204,71 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--map-margin-m", type=float, default=20.0)
     parser.add_argument("--min-map-size-m", type=float, default=50.0)
     parser.add_argument("--ground-z-ned", type=float, default=0.0)
-    parser.set_defaults(stop_on_object=True)
+    parser.set_defaults(replan_on_object=True)
     parser.add_argument(
+        "--replan-on-object",
         "--stop-on-object",
-        dest="stop_on_object",
+        dest="replan_on_object",
         action="store_true",
         help=(
-            "Scan the supplied route for static objects, stop before the first "
-            "blocked route point, land, and end the mission. Enabled by default."
+            "While flying, scan the route ahead for static objects, replace "
+            "blocked route points with an A* bypass, and continue to the "
+            "original goal. Enabled by default."
         ),
     )
     parser.add_argument(
+        "--no-replan-on-object",
         "--no-stop-on-object",
-        dest="stop_on_object",
+        dest="replan_on_object",
         action="store_false",
-        help="Disable the static object stop/land check.",
+        help="Disable the static object reroute check.",
+    )
+    parser.add_argument(
+        "--dynamic-replan-lookahead-waypoints",
+        type=int,
+        default=1,
+        help=(
+            "Number of upcoming route legs checked before each move. The default "
+            "checks only the immediate next leg so the drone follows the supplied "
+            "route until it reaches a blocked segment."
+        ),
+    )
+    parser.add_argument(
+        "--dynamic-replan-max-count",
+        type=int,
+        default=3,
+        help="Maximum number of live A* reroutes allowed during one mission.",
+    )
+    parser.add_argument(
+        "--dynamic-replan-max-segment-m",
+        type=float,
+        default=0.0,
+        help=(
+            "Densify the active route so live replan checks happen at least this "
+            "often in meters. Use 0 to keep only supplied/generated waypoints."
+        ),
+    )
+    parser.add_argument(
+        "--dynamic-replan-stop-hold-sec",
+        type=float,
+        default=1.0,
+        help="Seconds to hover after detecting an object and before planning bypass.",
+    )
+    parser.add_argument(
+        "--dynamic-replan-detection-margin-m",
+        type=float,
+        default=4.0,
+        help=(
+            "Small margin around the immediate route leg used for live object "
+            "detection. The larger --object-scan-margin-m is used only for A* "
+            "reroute planning."
+        ),
     )
     parser.add_argument(
         "--object-stop-distance-m",
         type=float,
         default=2.0,
-        help="Distance before the first blocked route point where the drone stops.",
+        help="Distance before the first blocked route point where the reroute starts.",
     )
     parser.add_argument(
         "--object-path-clearance-m",
@@ -1824,8 +2291,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--object-scan-margin-m",
         type=float,
-        default=4.0,
-        help="Extra meters added around the route when creating the scan grid.",
+        default=20.0,
+        help=(
+            "Extra meters added around the route when creating the scan/replan "
+            "grid."
+        ),
     )
     parser.add_argument(
         "--object-scan-min-size-m",
@@ -1838,6 +2308,48 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         default=1.0,
         help="Ignore occupied samples this close to the route start.",
+    )
+    parser.add_argument(
+        "--replan-waypoint-spacing-m",
+        type=float,
+        default=4.0,
+        help="Minimum spacing between generated A* reroute waypoints.",
+    )
+    parser.add_argument(
+        "--replan-rejoin-waypoints-ahead",
+        type=int,
+        default=3,
+        help=(
+            "Number of upcoming route waypoints to skip/replace before "
+            "automatically rejoining the normal route."
+        ),
+    )
+    parser.add_argument(
+        "--replan-rejoin-after-obstacle-m",
+        type=float,
+        default=4.0,
+        help="Minimum route distance after the detected object before rejoining.",
+    )
+    parser.add_argument(
+        "--replan-rejoin-clear-distance-m",
+        type=float,
+        default=3.0,
+        help="Required clear route distance before automatic rejoin is accepted.",
+    )
+    parser.add_argument(
+        "--replan-rejoin-point",
+        type=parse_vector3,
+        default=None,
+        help=(
+            "Optional explicit original-route waypoint to rejoin after bypassing "
+            "the object, for example \"45,17,-13\"."
+        ),
+    )
+    parser.add_argument(
+        "--replan-rejoin-tolerance-m",
+        type=float,
+        default=1.0,
+        help="Tolerance for matching --replan-rejoin-point to the original route.",
     )
     parser.add_argument(
         "--min-altitude",
