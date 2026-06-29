@@ -1,8 +1,9 @@
 """
-- User defines a route.
-- Drone follows the route
-- If drone encounters an obstacle, it replans the route to avoid the obstacle and continues to follow the new route.
-- If drone reaches the end of the route, it lands.
+Manual route-following baseline for a PX4-style Project AirSim drone.
+
+The user provides a route as [START, NED1, NED2, ..., END], and the drone
+follows those points in order. Obstacle detection and A* segment replacement
+will be added after this baseline is working.
 """
 
 import argparse
@@ -28,6 +29,12 @@ from projectairsim.utils import (
     projectairsim_log,
     rpy_to_quaternion,
     unpack_image,
+)
+
+# px4_astar_autopilot is located in ../example_user_scripts/px4_astar_autopilot.py, so we add that directory to sys.path to import it
+# W:\UnsyncProjects\DroneSimDev\client\python\
+sys.path.append(
+    str(Path(__file__).resolve().parent.parent / "example_user_scripts")
 )
 
 from px4_astar_autopilot import (
@@ -72,9 +79,36 @@ def parse_vector3(value: str) -> List[float]:
         ) from exc
 
 
+def parse_route(value: str) -> List[List[float]]:
+    route = []
+    for index, point_text in enumerate(value.split(";")):
+        point_text = point_text.strip()
+        if not point_text:
+            continue
+        try:
+            route.append(parse_vector3(point_text))
+        except argparse.ArgumentTypeError as exc:
+            raise argparse.ArgumentTypeError(
+                f"Invalid route point {index}: {exc}"
+            ) from exc
+
+    if len(route) < 2:
+        raise argparse.ArgumentTypeError(
+            "--route must contain at least START and END points separated by ';'"
+        )
+    return route
+
+
 def normalize_vector_args(argv: Sequence[str]) -> List[str]:
     normalized = []
-    vector_options = {"--start", "--goal", "--waypoint", "--map-center", "--map-size"}
+    vector_options = {
+        "--start",
+        "--goal",
+        "--waypoint",
+        "--map-center",
+        "--map-size",
+        "--route",
+    }
     idx = 0
     while idx < len(argv):
         arg = argv[idx]
@@ -115,6 +149,7 @@ def resolve_config_path(config_name: str, sim_config_path: str) -> Path:
     candidates = [
         config_dir / config_path,
         Path(__file__).resolve().parent / config_dir / config_path,
+        Path(__file__).resolve().parent.parent / "example_user_scripts" / config_dir / config_path,
     ]
     for candidate in candidates:
         if candidate.exists():
@@ -903,7 +938,7 @@ def waypoints_from_path(path: Sequence[Sequence[float]]) -> List[Waypoint]:
         if index == 0:
             label = "START"
         elif index == final_index:
-            label = "GOAL"
+            label = "END"
         else:
             label = f"WP{index:03d}"
         waypoints.append(
@@ -998,19 +1033,31 @@ def plan_astar_route(world: World, args) -> List[List[float]]:
 
 
 def build_route_path(world: World, args, drone: Drone) -> List[List[float]]:
-    if args.goal is not None:
-        return plan_astar_route(world, args)
+    del world
 
-    manual_waypoints = collect_waypoints(args, drone)
-    if args.waypoint:
-        start = args.start or get_pose_position_ned(drone)
-        path = [start] + [waypoint.position for waypoint in manual_waypoints]
-        if args.print_waypoints:
-            for index, point in enumerate(path):
-                projectairsim_log().info("Waypoint %03d: %s", index, point)
-        return path
+    if args.route:
+        path = args.route
+    else:
+        path = []
+        path.append(args.start or get_pose_position_ned(drone))
+        path.extend(args.waypoint or [])
+        if args.goal is not None:
+            path.append(args.goal)
 
-    return [waypoint.position for waypoint in manual_waypoints]
+    if len(path) < 2:
+        raise RuntimeError(
+            "Provide a route with --route, or provide at least one --waypoint/--goal "
+            "after the optional --start."
+        )
+
+    path = [
+        [float(point[0]), float(point[1]), float(point[2])]
+        for point in path
+    ]
+    if args.print_waypoints:
+        for index, point in enumerate(path):
+            projectairsim_log().info("Route point %03d: %s", index, point)
+    return path
 
 
 def plot_world_waypoint_markers(world: World, waypoints: Sequence[Waypoint], args):
@@ -1149,7 +1196,11 @@ async def await_drone_task(
 
 async def run_overlay(args):
     camera_sensor_id = camera_arg_to_sensor_id(args.camera)
-    has_explicit_flight_target = bool(args.goal is not None or args.waypoint)
+    if args.route and args.start is None:
+        args.start = args.route[0]
+    has_explicit_flight_target = bool(
+        args.route or args.goal is not None or args.waypoint
+    )
     route_path = None
     temp_config_dir = None
     client = ProjectAirSimClient(
@@ -1299,8 +1350,8 @@ async def run_overlay(args):
                     None,
                 )
                 projectairsim_log().info(
-                    "Reached destination %s",
-                    args.goal or route_path[-1],
+                    "Reached route destination %s",
+                    route_path[-1],
                 )
                 if args.land_at_goal:
                     projectairsim_log().info("Landing at destination")
@@ -1316,7 +1367,8 @@ async def run_overlay(args):
                     return
             elif not has_explicit_flight_target:
                 projectairsim_log().info(
-                    "No explicit --goal/--waypoint supplied; holding after takeoff"
+                    "No explicit --route/--goal/--waypoint supplied; holding after "
+                    "takeoff"
                 )
         elif args.wait_for_px4_ready:
             await wait_for_px4_ready(drone, args.px4_ready_timeout_sec)
@@ -1390,20 +1442,36 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument("--scene", default="scene_px4_sitl.jsonc")
-    parser.add_argument("--sim-config-path", default="sim_config/")
+    parser.add_argument(
+        "--sim-config-path",
+        default="../example_user_scripts/sim_config/",
+    )
     parser.add_argument("--drone-name", default="Drone1")
     parser.add_argument("--server-ip", default="127.0.0.1")
     parser.add_argument("--topics-port", type=int, default=8989)
     parser.add_argument("--services-port", type=int, default=8990)
     parser.add_argument("--load-delay-sec", type=float, default=2.0)
     parser.add_argument("--start", type=parse_vector3, help="NED x,y,z")
-    parser.add_argument("--goal", type=parse_vector3, help="NED x,y,z waypoint")
+    parser.add_argument(
+        "--goal",
+        type=parse_vector3,
+        help="Final route point as NED x,y,z.",
+    )
     parser.add_argument(
         "--waypoint",
         action="append",
         type=parse_vector3,
         default=None,
-        help="NED x,y,z waypoint to draw. Repeat for multiple waypoints.",
+        help="Intermediate route point as NED x,y,z. Repeat for multiple waypoints.",
+    )
+    parser.add_argument(
+        "--route",
+        type=parse_route,
+        default=None,
+        help=(
+            "Full route as semicolon-separated NED points, for example "
+            "\"0,0,-5; 20,0,-5; 20,15,-5\". Overrides --start/--waypoint/--goal."
+        ),
     )
     parser.add_argument(
         "--start-as-scene-origin",
