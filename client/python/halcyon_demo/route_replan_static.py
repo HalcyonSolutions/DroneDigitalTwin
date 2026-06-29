@@ -66,6 +66,7 @@ FRIENDLY_CAMERA_IDS = {
 class Waypoint:
     label: str
     position: List[float]
+    status: str = "active"
 
 
 @dataclass
@@ -77,6 +78,7 @@ class StaticRouteObstacle:
     segment_index: int
     rejoin_index: Optional[int] = None
     rejoin_point: Optional[List[float]] = None
+    skipped_points: Optional[List[List[float]]] = None
 
 
 @dataclass
@@ -992,9 +994,58 @@ class FpvWaypointOverlayDisplay:
         camera_position, _ = camera_pose
         status_y = 54
         for index, waypoint in enumerate(self.waypoints):
+            is_skipped = waypoint.status == "skipped"
             world_distance_m = distance_between(camera_position, waypoint.position)
-            if world_distance_m <= self.reached_distance_m:
+            if not is_skipped and world_distance_m <= self.reached_distance_m:
                 self.reached_waypoints[index] = True
+
+            if is_skipped:
+                cv2.putText(
+                    frame,
+                    f"{waypoint.label}: skipped",
+                    (12, status_y),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.5,
+                    (0, 0, 255),
+                    2,
+                    cv2.LINE_AA,
+                )
+                projection = project_waypoint(waypoint.position, image, self.fov_degrees)
+                if projection is not None:
+                    pixel_x, pixel_y, distance_m, _ = projection
+                    inside = 0 <= pixel_x < width and 0 <= pixel_y < height
+                    label = f"{waypoint.label} skipped"
+                    if inside:
+                        center = (int(round(pixel_x)), int(round(pixel_y)))
+                        cv2.circle(frame, center, 9, (0, 0, 255), 2, cv2.LINE_AA)
+                        cv2.drawMarker(
+                            frame,
+                            center,
+                            (0, 0, 255),
+                            markerType=cv2.MARKER_TILTED_CROSS,
+                            markerSize=18,
+                            thickness=2,
+                            line_type=cv2.LINE_AA,
+                        )
+                        self.draw_text_with_shadow(
+                            cv2,
+                            frame,
+                            label,
+                            (center[0] + 12, center[1] - 12),
+                            color=(0, 0, 255),
+                        )
+                    elif self.draw_edge_indicators:
+                        edge = self.edge_point(width, height, pixel_x, pixel_y)
+                        cv2.circle(frame, edge, 8, (0, 0, 255), 2, cv2.LINE_AA)
+                        self.draw_text_with_shadow(
+                            cv2,
+                            frame,
+                            label,
+                            (edge[0] + 8, edge[1] - 8),
+                            color=(0, 0, 255),
+                        )
+                status_y += 20
+                continue
 
             if self.reached_waypoints[index]:
                 cv2.putText(
@@ -1060,7 +1111,14 @@ class FpvWaypointOverlayDisplay:
             )
             status_y += 20
 
-    def draw_text_with_shadow(self, cv2, frame, text: str, origin: Tuple[int, int]):
+    def draw_text_with_shadow(
+        self,
+        cv2,
+        frame,
+        text: str,
+        origin: Tuple[int, int],
+        color: Tuple[int, int, int] = (0, 255, 255),
+    ):
         x = max(4, min(frame.shape[1] - 160, origin[0]))
         y = max(18, min(frame.shape[0] - 8, origin[1]))
         cv2.putText(
@@ -1079,7 +1137,7 @@ class FpvWaypointOverlayDisplay:
             (x, y),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.62,
-            (0, 255, 255),
+            color,
             1,
             cv2.LINE_AA,
         )
@@ -1141,6 +1199,7 @@ def collect_waypoints(args, drone: Drone) -> List[Waypoint]:
 def waypoints_from_path(
     path: Sequence[Sequence[float]],
     final_label: str = "END",
+    skipped_points: Optional[Sequence[Sequence[float]]] = None,
 ) -> List[Waypoint]:
     final_index = len(path) - 1
     waypoints = []
@@ -1153,6 +1212,14 @@ def waypoints_from_path(
             label = f"WP{index:03d}"
         waypoints.append(
             Waypoint(label, [float(point[0]), float(point[1]), float(point[2])])
+        )
+    for index, point in enumerate(skipped_points or [], start=1):
+        waypoints.append(
+            Waypoint(
+                f"SKIP{index:03d}",
+                [float(point[0]), float(point[1]), float(point[2])],
+                "skipped",
+            )
         )
     return waypoints
 
@@ -1545,6 +1612,10 @@ def build_rerouted_path(
     rejoin_point = [float(value) for value in path[rejoin_index]]
     obstacle.rejoin_index = rejoin_index
     obstacle.rejoin_point = rejoin_point
+    obstacle.skipped_points = [
+        [float(point[0]), float(point[1]), float(point[2])]
+        for point in path[1:rejoin_index]
+    ]
 
     if args.replan_emergency_node is not None:
         projectairsim_log().info(
@@ -1586,6 +1657,13 @@ def build_rerouted_path(
         rejoin_index,
         format_vector3(rejoin_point),
     )
+    if obstacle.skipped_points:
+        for index, point in enumerate(obstacle.skipped_points, start=1):
+            projectairsim_log().warning(
+                "Skipped waypoint %03d because of obstacle: %s",
+                index,
+                format_vector3(point),
+            )
     return mission_path
 
 
@@ -1623,8 +1701,9 @@ def refresh_dynamic_route_visuals(
     display: Optional[FpvWaypointOverlayDisplay],
     active_path: Sequence[Sequence[float]],
     args,
+    skipped_points: Optional[Sequence[Sequence[float]]] = None,
 ) -> None:
-    waypoints = waypoints_from_path(active_path)
+    waypoints = waypoints_from_path(active_path, skipped_points=skipped_points)
     if display:
         display.set_waypoints(waypoints)
     plot_world_waypoint_markers(world, waypoints, args)
@@ -1721,6 +1800,7 @@ async def fly_path_with_dynamic_replanning(
     waypoint_index = 1
     commanded_velocity = [0.0, 0.0, 0.0]
     replan_count = 0
+    skipped_display_points = []
 
     while waypoint_index < len(active_path):
         current = get_pose_position_ned(drone)
@@ -1738,7 +1818,15 @@ async def fly_path_with_dynamic_replanning(
                 replan_count += 1
                 active_path = new_path
                 waypoint_index = new_index
-                refresh_dynamic_route_visuals(world, display, active_path, args)
+                for point in obstacle.skipped_points or []:
+                    append_unique_point(skipped_display_points, point)
+                refresh_dynamic_route_visuals(
+                    world,
+                    display,
+                    active_path,
+                    args,
+                    skipped_display_points,
+                )
                 projectairsim_log().warning(
                     "Dynamic reroute %d/%d built while flying. Continuing via "
                     "%d active waypoint(s).",
@@ -1781,35 +1869,63 @@ def plot_world_waypoint_markers(world: World, waypoints: Sequence[Waypoint], arg
     if args.no_world_markers:
         return
 
-    points = [waypoint.position for waypoint in waypoints]
-    labels = [waypoint.label for waypoint in waypoints]
-    label_positions = [
-        [
-            waypoint.position[0],
-            waypoint.position[1],
-            waypoint.position[2] - args.world_label_z_offset_m,
-        ]
-        for waypoint in waypoints
+    active_waypoints = [
+        waypoint for waypoint in waypoints if waypoint.status != "skipped"
+    ]
+    skipped_waypoints = [
+        waypoint for waypoint in waypoints if waypoint.status == "skipped"
     ]
 
     if args.flush_markers:
         world.flush_persistent_markers()
 
-    world.plot_debug_points(
-        points,
-        [1.0, 1.0, 0.0, 1.0],
-        args.world_marker_size,
-        args.world_marker_duration_sec,
-        args.persistent_world_markers,
+    def label_positions_for(group: Sequence[Waypoint]) -> List[List[float]]:
+        return [
+            [
+                waypoint.position[0],
+                waypoint.position[1],
+                waypoint.position[2] - args.world_label_z_offset_m,
+            ]
+            for waypoint in group
+        ]
+
+    if active_waypoints:
+        world.plot_debug_points(
+            [waypoint.position for waypoint in active_waypoints],
+            [1.0, 1.0, 0.0, 1.0],
+            args.world_marker_size,
+            args.world_marker_duration_sec,
+            args.persistent_world_markers,
+        )
+        world.plot_debug_strings(
+            [waypoint.label for waypoint in active_waypoints],
+            label_positions_for(active_waypoints),
+            args.world_label_scale,
+            [1.0, 1.0, 1.0, 1.0],
+            args.world_marker_duration_sec,
+        )
+
+    if skipped_waypoints:
+        world.plot_debug_points(
+            [waypoint.position for waypoint in skipped_waypoints],
+            [1.0, 0.0, 0.0, 1.0],
+            args.world_marker_size * 1.25,
+            args.world_marker_duration_sec,
+            args.persistent_world_markers,
+        )
+        world.plot_debug_strings(
+            [f"{waypoint.label} skipped" for waypoint in skipped_waypoints],
+            label_positions_for(skipped_waypoints),
+            args.world_label_scale,
+            [1.0, 0.0, 0.0, 1.0],
+            args.world_marker_duration_sec,
+        )
+
+    projectairsim_log().info(
+        "Plotted %d waypoint marker(s) in the scene (%d skipped)",
+        len(waypoints),
+        len(skipped_waypoints),
     )
-    world.plot_debug_strings(
-        labels,
-        label_positions,
-        args.world_label_scale,
-        [1.0, 1.0, 1.0, 1.0],
-        args.world_marker_duration_sec,
-    )
-    projectairsim_log().info("Plotted %d waypoint marker(s) in the scene", len(points))
 
 
 async def wait_for_px4_ready(drone: Drone, timeout_sec: float):
