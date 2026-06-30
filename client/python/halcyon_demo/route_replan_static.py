@@ -848,6 +848,9 @@ class FpvWaypointOverlayDisplay:
         self.thread = None
         self.frame_count = 0
         self.error = None
+        self._last_frame_time = None
+        self._frame_intervals = []
+        self._pending_first_frame = None
 
     def start(self):
         if self.running:
@@ -902,6 +905,15 @@ class FpvWaypointOverlayDisplay:
                     continue
                 frame = frame.copy()
 
+                now = time.monotonic()
+                if self._last_frame_time is not None:
+                    interval = now - self._last_frame_time
+                    if interval > 0.0:
+                        self._frame_intervals.append(interval)
+                        if len(self._frame_intervals) > 30:
+                            self._frame_intervals.pop(0)
+                self._last_frame_time = now
+
                 if frame.ndim == 2:
                     frame = cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
                 elif frame.ndim == 3 and frame.shape[2] == 1:
@@ -936,17 +948,28 @@ class FpvWaypointOverlayDisplay:
             if created:
                 cv2.destroyWindow(self.window_name)
 
+    def _compute_video_fps(self) -> float:
+        if not self._frame_intervals:
+            return self.max_fps
+        average_interval = sum(self._frame_intervals) / len(self._frame_intervals)
+        return min(self.max_fps, max(1.0, 1.0 / max(average_interval, 1e-6)))
+
     def write_video_frame(self, cv2, frame):
         if self.video_output_path is None:
             return
 
         if self.video_writer is None:
+            if self._pending_first_frame is None:
+                self._pending_first_frame = frame
+                return
+
             height, width = frame.shape[:2]
             fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+            video_fps = self._compute_video_fps()
             self.video_writer = cv2.VideoWriter(
                 str(self.video_output_path),
                 fourcc,
-                self.max_fps,
+                video_fps,
                 (width, height),
             )
             if not self.video_writer.isOpened():
@@ -954,7 +977,13 @@ class FpvWaypointOverlayDisplay:
                 raise RuntimeError(
                     f"Could not open FPV video writer: {self.video_output_path}"
                 )
-            projectairsim_log().info("Recording FPV video to %s", self.video_output_path)
+            projectairsim_log().info(
+                "Recording FPV video to %s at %.1f FPS",
+                self.video_output_path,
+                video_fps,
+            )
+            self.video_writer.write(self._pending_first_frame)
+            self._pending_first_frame = None
 
         self.video_writer.write(frame)
 
