@@ -38,6 +38,9 @@ python route_replan_static.py `
   --path-yaw-deadband-deg 5 `
   --path-yaw-response-sec 1.5 `
   --waypoint-acceptance-m 2 `
+  --final-goal-acceptance-m 3 `
+  --final-goal-no-progress-sec 6 `
+  --final-goal-obstacle-tolerance-m 2 `
   --flight-driver velocity `
   --max-fps 33.33 `
   --camera-capture-interval-sec 0.03 `
@@ -46,6 +49,8 @@ python route_replan_static.py `
 ```
 
 Use `--flight-driver path-api` only for experiments without `--start-as-scene-origin`; with scene-NED routes, the velocity driver keeps the route frame consistent.
+
+Use `--max-fps 60 ` and `--camera-capture-interval-sec 0.016` where $1/60=0.016...$
 
 ## Test paths
 - short without any obstacles: `72,-8,-4; 69,-10,-40; 66,-11,-40; 63,-11,-40; 60,-12,-40; 57,-12,-40; 54,-12,-40; 51,-12,-40; 48,-12,-40; 45,-13,-40; 42,-13,-40; 39,-16,-40; 36,-17,-40; 33,-19,-6`

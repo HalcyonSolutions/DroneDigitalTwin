@@ -876,6 +876,10 @@ class FpvWaypointOverlayDisplay:
         self.waypoints = list(waypoints)
         self.reached_waypoints = [False for _ in self.waypoints]
 
+    def mark_final_waypoint_reached(self) -> None:
+        if self.reached_waypoints:
+            self.reached_waypoints[-1] = True
+
     def display_loop(self):
         import cv2
 
@@ -1611,10 +1615,18 @@ def find_explicit_rejoin_index(
             best_distance = distance_m
 
     if best_index is None or best_distance > args.replan_rejoin_tolerance_m:
-        raise RuntimeError(
-            "--replan-rejoin-point was not found in the remaining route within "
-            f"{args.replan_rejoin_tolerance_m:.2f}m"
+        nearest_text = "none" if best_index is None else format_vector3(path[best_index])
+        projectairsim_log().warning(
+            "--replan-rejoin-point %s is not in the current remaining route "
+            "within %.2fm; nearest remaining point is %s at %.2fm. The drone "
+            "has likely already passed the explicit rejoin point, so this "
+            "reroute will choose an automatic downstream rejoin instead.",
+            format_vector3(args.replan_rejoin_point),
+            args.replan_rejoin_tolerance_m,
+            nearest_text,
+            best_distance,
         )
+        return None
     return best_index
 
 
@@ -1912,6 +1924,22 @@ def build_dynamic_rerouted_path(
     return rerouted_path
 
 
+def is_obstacle_at_final_goal(
+    args,
+    active_path: Sequence[Sequence[float]],
+    waypoint_index: int,
+    obstacle: StaticRouteObstacle,
+) -> bool:
+    if waypoint_index != len(active_path) - 1:
+        return False
+    tolerance_m = max(
+        0.0,
+        args.final_goal_obstacle_tolerance_m,
+        args.object_scan_sample_spacing_m,
+    )
+    return distance_between(obstacle.obstacle_point, active_path[-1]) <= tolerance_m
+
+
 async def maybe_replan_active_route(
     world: World,
     drone: Drone,
@@ -1929,6 +1957,19 @@ async def maybe_replan_active_route(
         current_position,
     )
     if obstacle is None:
+        return list(active_path), waypoint_index, None, list(commanded_velocity)
+
+    if is_obstacle_at_final_goal(args, active_path, waypoint_index, obstacle):
+        if not getattr(args, "_final_goal_obstacle_logged", False):
+            projectairsim_log().info(
+                "Ignoring object detection at final goal %s because the occupied "
+                "sample %s is within %.2fm of END. Continuing final approach so "
+                "goal acceptance and landing can complete.",
+                format_vector3(active_path[-1]),
+                format_vector3(obstacle.obstacle_point),
+                args.final_goal_obstacle_tolerance_m,
+            )
+            args._final_goal_obstacle_logged = True
         return list(active_path), waypoint_index, None, list(commanded_velocity)
 
     projectairsim_log().warning(
@@ -1992,6 +2033,8 @@ async def fly_one_waypoint_smooth(
     segment_has_heading = math.hypot(segment_delta[0], segment_delta[1]) > 0.1
     started_at = time.time()
     last_report_at = 0.0
+    best_final_distance = math.inf
+    last_final_progress_at = started_at
     velocity = [
         float(commanded_velocity[0]),
         float(commanded_velocity[1]),
@@ -2001,7 +2044,11 @@ async def fly_one_waypoint_smooth(
     while True:
         current = get_pose_position_ned(drone)
         distance = distance_between(current, target)
-        if distance <= args.waypoint_acceptance_m:
+        acceptance_m = args.waypoint_acceptance_m
+        if is_final_waypoint:
+            acceptance_m = max(acceptance_m, args.final_goal_acceptance_m)
+
+        if distance <= acceptance_m:
             if is_final_waypoint:
                 velocity = await brake_to_stop_by_velocity(
                     drone,
@@ -2019,6 +2066,34 @@ async def fly_one_waypoint_smooth(
             return list(active_path), waypoint_index + 1, velocity, None
 
         elapsed = time.time() - started_at
+        if is_final_waypoint:
+            if distance < best_final_distance - 0.1:
+                best_final_distance = distance
+                last_final_progress_at = time.time()
+            final_settle_radius_m = max(acceptance_m, slowdown_distance_m)
+            if (
+                args.final_goal_no_progress_sec > 0.0
+                and distance <= final_settle_radius_m
+                and time.time() - last_final_progress_at
+                >= args.final_goal_no_progress_sec
+            ):
+                velocity = await brake_to_stop_by_velocity(
+                    drone,
+                    velocity,
+                    command_duration_sec,
+                    max_velocity_delta,
+                )
+                projectairsim_log().info(
+                    "Final waypoint %03d accepted after settling near target %s; "
+                    "pose NED %s; error %.2f m; best error %.2f m",
+                    waypoint_index,
+                    format_vector3(target),
+                    format_vector3(current),
+                    distance,
+                    best_final_distance,
+                )
+                return list(active_path), waypoint_index + 1, velocity, None
+
         if args.move_timeout_sec > 0 and elapsed > args.move_timeout_sec:
             drone.cancel_last_task()
             raise RuntimeError(
@@ -2799,6 +2874,8 @@ async def run_overlay(args):
                             "Completed mission with %d dynamic reroute(s).",
                             replan_count,
                         )
+                    if display:
+                        display.mark_final_waypoint_reached()
                 else:
                     if args.flight_driver == "path-api":
                         await fly_path_by_path_api(drone, mission_path, args)
@@ -2819,6 +2896,8 @@ async def run_overlay(args):
                             None,
                             None,
                         )
+                    if display:
+                        display.mark_final_waypoint_reached()
                 projectairsim_log().info(
                     "Reached route destination %s",
                     mission_path[-1],
@@ -3143,8 +3222,10 @@ def build_parser() -> argparse.ArgumentParser:
         type=parse_vector3,
         default=None,
         help=(
-            "Optional explicit downstream point from the original route to rejoin "
-            "after bypassing the object, for example \"45,17,-13\"."
+            "Optional preferred downstream point from the remaining route to "
+            "rejoin after bypassing the object, for example \"45,17,-13\". "
+            "If the drone has already passed it during a later reroute, an "
+            "automatic downstream rejoin is used."
         ),
     )
     parser.add_argument(
@@ -3187,6 +3268,34 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument("--waypoint-acceptance-m", type=float, default=1.0)
+    parser.add_argument(
+        "--final-goal-acceptance-m",
+        type=float,
+        default=3.0,
+        help=(
+            "Acceptance radius for the final route point. This can be larger "
+            "than intermediate waypoint acceptance so the mission ends cleanly "
+            "when PX4 settles near the goal."
+        ),
+    )
+    parser.add_argument(
+        "--final-goal-no-progress-sec",
+        type=float,
+        default=6.0,
+        help=(
+            "If the final waypoint is inside the slowdown radius and no longer "
+            "getting closer for this many seconds, accept it as reached."
+        ),
+    )
+    parser.add_argument(
+        "--final-goal-obstacle-tolerance-m",
+        type=float,
+        default=2.0,
+        help=(
+            "Ignore static-object detections this close to the final route point "
+            "so the mission can finish instead of replanning around END."
+        ),
+    )
     parser.add_argument(
         "--waypoint-hold-sec",
         type=float,
