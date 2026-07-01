@@ -539,6 +539,12 @@ def make_runtime_scene_config(args, camera_sensor_id: str):
             robot_config = load_jsonc(robot_config_path)
             if actor is target_actor:
                 ensure_requested_camera(robot_config, camera_sensor_id, args)
+                if args.third_person_overlay:
+                    ensure_requested_camera(
+                        robot_config,
+                        camera_arg_to_sensor_id(args.third_person_camera),
+                        args,
+                    )
 
             suffix = robot_config_path.suffix or ".jsonc"
             output_name = f"{robot_config_path.stem}_{actor_index}_fpv{suffix}"
@@ -698,6 +704,28 @@ def make_camera_angle_pose(args, camera_sensor_id: str, angle_deg: float) -> Pos
     )
 
 
+def make_third_person_camera_pose(
+    distance_m: float,
+    height_m: float,
+    pitch_deg: float,
+) -> Pose:
+    distance_m = max(0.1, distance_m)
+    w, x, y, z = rpy_to_quaternion(0.0, math.radians(-pitch_deg), 0.0)
+    return Pose(
+        {
+            "translation": Vector3(
+                {
+                    "x": -distance_m,
+                    "y": 0.0,
+                    "z": -height_m,
+                }
+            ),
+            "rotation": Quaternion({"w": w, "x": x, "y": y, "z": z}),
+            "frame_id": "DEFAULT_ID",
+        }
+    )
+
+
 def require_scene_camera_topic(drone: Drone, camera_sensor_id: str) -> str:
     if camera_sensor_id not in drone.sensors:
         raise RuntimeError(
@@ -830,6 +858,10 @@ class FpvWaypointOverlayDisplay:
         reached_distance_m: float,
         max_fps: float,
         video_output_path: Optional[Path],
+        third_person_overlay: bool,
+        third_person_overlay_width_frac: float,
+        third_person_overlay_margin_px: int,
+        third_person_label: str,
     ):
         self.window_name = window_name
         self.waypoints = list(waypoints)
@@ -844,6 +876,14 @@ class FpvWaypointOverlayDisplay:
         self.video_writer = None
         self.image_queue = queue.SimpleQueue()
         self.buffer_size = 3
+        self.third_person_overlay = third_person_overlay
+        self.third_person_overlay_width_frac = max(
+            0.1,
+            min(0.6, third_person_overlay_width_frac),
+        )
+        self.third_person_overlay_margin_px = max(0, int(third_person_overlay_margin_px))
+        self.third_person_label = third_person_label
+        self.third_person_image = None
         self.running = False
         self.thread = None
         self.frame_count = 0
@@ -871,6 +911,11 @@ class FpvWaypointOverlayDisplay:
         while not self.image_queue.empty() and self.image_queue.qsize() > self.buffer_size:
             self.image_queue.get()
         self.image_queue.put(image)
+
+    def receive_third_person(self, image):
+        if not self.running or image is None:
+            return
+        self.third_person_image = image
 
     def set_waypoints(self, waypoints: Sequence[Waypoint]) -> None:
         self.waypoints = list(waypoints)
@@ -925,6 +970,7 @@ class FpvWaypointOverlayDisplay:
 
                 self.frame_count += 1
                 self.draw_overlay(cv2, frame, image)
+                self.draw_third_person_overlay(cv2, frame)
 
                 if self.resize_x is not None and self.resize_y is not None:
                     frame = cv2.resize(frame, (self.resize_x, self.resize_y))
@@ -990,6 +1036,60 @@ class FpvWaypointOverlayDisplay:
             self._pending_first_frame = None
 
         self.video_writer.write(frame)
+
+    def draw_third_person_overlay(self, cv2, frame) -> None:
+        if not self.third_person_overlay or self.third_person_image is None:
+            return
+
+        inset = unpack_image(self.third_person_image)
+        if inset is None:
+            return
+        if inset.ndim == 2:
+            inset = cv2.cvtColor(inset, cv2.COLOR_GRAY2BGR)
+        elif inset.ndim == 3 and inset.shape[2] == 1:
+            inset = cv2.cvtColor(inset[:, :, 0], cv2.COLOR_GRAY2BGR)
+
+        frame_height, frame_width = frame.shape[:2]
+        inset_height, inset_width = inset.shape[:2]
+        if frame_height <= 0 or frame_width <= 0 or inset_height <= 0 or inset_width <= 0:
+            return
+
+        margin = self.third_person_overlay_margin_px
+        available_width = max(1, frame_width - (2 * margin))
+        available_height = max(1, frame_height - (2 * margin))
+        target_width = min(
+            available_width,
+            max(80, int(frame_width * self.third_person_overlay_width_frac)),
+        )
+        target_height = max(1, int(target_width * inset_height / inset_width))
+        max_height = max(1, int(frame_height * 0.42))
+        if target_height > max_height:
+            target_height = min(max_height, available_height)
+            target_width = max(1, int(target_height * inset_width / inset_height))
+
+        target_width = min(target_width, available_width)
+        target_height = min(target_height, available_height)
+        x0 = max(0, frame_width - margin - target_width)
+        y0 = max(0, margin)
+        x1 = min(frame_width, x0 + target_width)
+        y1 = min(frame_height, y0 + target_height)
+        if x1 <= x0 or y1 <= y0:
+            return
+
+        inset_resized = cv2.resize(inset, (x1 - x0, y1 - y0))
+        frame[y0:y1, x0:x1] = inset_resized
+        cv2.rectangle(frame, (x0, y0), (x1 - 1, y1 - 1), (255, 255, 255), 2)
+        cv2.rectangle(frame, (x0, y0), (x1 - 1, min(y1 - 1, y0 + 24)), (20, 20, 20), -1)
+        cv2.putText(
+            frame,
+            self.third_person_label,
+            (x0 + 8, y0 + 17),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.5,
+            (255, 255, 255),
+            1,
+            cv2.LINE_AA,
+        )
 
     def draw_overlay(self, cv2, frame, image):
         height, width = frame.shape[:2]
@@ -2673,6 +2773,7 @@ async def await_drone_task(
 
 async def run_overlay(args):
     camera_sensor_id = camera_arg_to_sensor_id(args.camera)
+    third_person_camera_sensor_id = camera_arg_to_sensor_id(args.third_person_camera)
     if args.route and args.start is None:
         args.start = args.route[0]
     has_explicit_flight_target = bool(
@@ -2735,6 +2836,43 @@ async def run_overlay(args):
                 args.camera_angle_deg,
             )
 
+        third_person_topic = None
+        if args.third_person_overlay:
+            try:
+                third_person_pose = make_third_person_camera_pose(
+                    args.third_person_camera_distance_m,
+                    args.third_person_camera_height_m,
+                    args.third_person_camera_pitch_deg,
+                )
+                if not drone.set_camera_pose(
+                    third_person_camera_sensor_id,
+                    third_person_pose,
+                ):
+                    projectairsim_log().warning(
+                        "Failed to set %s third-person camera pose; using configured pose.",
+                        third_person_camera_sensor_id,
+                    )
+                else:
+                    projectairsim_log().info(
+                        "Set %s third-person camera %.2fm behind, %.2fm above, "
+                        "pitch %.1f deg down",
+                        third_person_camera_sensor_id,
+                        args.third_person_camera_distance_m,
+                        args.third_person_camera_height_m,
+                        args.third_person_camera_pitch_deg,
+                    )
+                third_person_topic = require_scene_camera_topic(
+                    drone,
+                    third_person_camera_sensor_id,
+                )
+            except Exception as exc:
+                projectairsim_log().warning(
+                    "Third-person overlay disabled because camera %s is not available: %s",
+                    third_person_camera_sensor_id,
+                    exc,
+                )
+                args.third_person_overlay = False
+
         if has_explicit_flight_target:
             route_path = build_route_path(world, args, drone)
             mission_path = route_path
@@ -2773,10 +2911,23 @@ async def run_overlay(args):
             args.waypoint_acceptance_m,
             args.max_fps,
             video_output_path,
+            args.third_person_overlay,
+            args.third_person_overlay_width_frac,
+            args.third_person_overlay_margin_px,
+            "3rd Person View - Chase Camera",
         )
         display.start()
         client.subscribe(camera_topic, lambda _, image: display.receive(image))
         projectairsim_log().info("Subscribed FPV camera topic: %s", camera_topic)
+        if args.third_person_overlay and third_person_topic:
+            client.subscribe(
+                third_person_topic,
+                lambda _, image: display.receive_third_person(image),
+            )
+            projectairsim_log().info(
+                "Subscribed third-person overlay camera topic: %s",
+                third_person_topic,
+            )
         projectairsim_log().info("Press Esc in the OpenCV window or Ctrl+C to stop")
 
         if not args.skip_takeoff:
@@ -3429,6 +3580,54 @@ def build_parser() -> argparse.ArgumentParser:
         "--keep-overlay-after-mission",
         action="store_true",
         help="Keep the FPV overlay open after reaching/landing at the goal.",
+    )
+    parser.set_defaults(third_person_overlay=True)
+    parser.add_argument(
+        "--third-person-overlay",
+        dest="third_person_overlay",
+        action="store_true",
+        help="Draw the third-person camera feed as an upper-right inset in the FPV recording.",
+    )
+    parser.add_argument(
+        "--no-third-person-overlay",
+        dest="third_person_overlay",
+        action="store_false",
+        help="Disable the third-person picture-in-picture inset.",
+    )
+    parser.add_argument(
+        "--third-person-camera",
+        default="chase",
+        help="Camera used for the third-person inset. Friendly default is chase.",
+    )
+    parser.add_argument(
+        "--third-person-camera-distance-m",
+        type=float,
+        default=10.0,
+        help="How far behind the drone the third-person camera is placed.",
+    )
+    parser.add_argument(
+        "--third-person-camera-height-m",
+        type=float,
+        default=1.5,
+        help="How far above the drone the third-person camera is placed.",
+    )
+    parser.add_argument(
+        "--third-person-camera-pitch-deg",
+        type=float,
+        default=12.0,
+        help="Downward pitch angle for the third-person camera.",
+    )
+    parser.add_argument(
+        "--third-person-overlay-width-frac",
+        type=float,
+        default=0.28,
+        help="Inset width as a fraction of the recorded FPV frame width.",
+    )
+    parser.add_argument(
+        "--third-person-overlay-margin-px",
+        type=int,
+        default=16,
+        help="Pixel margin from the top/right edge for the third-person inset.",
     )
     parser.add_argument(
         "--camera-angle-deg",
