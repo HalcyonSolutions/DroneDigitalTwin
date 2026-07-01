@@ -45,7 +45,13 @@ python route_replan_static.py `
   --max-fps 33.33 `
   --camera-capture-interval-sec 0.03 `
   --preview-width 1980 `
-  --preview-height 1080
+  --preview-height 1080 `
+  --third-person-overlay `
+  --third-person-camera chase `
+  --third-person-camera-distance-m 3 `
+  --third-person-camera-height-m 1.5 `
+  --third-person-camera-pitch-deg 12 `
+  --third-person-overlay-width-frac 0.28
 ```
 
 Use `--flight-driver path-api` only for experiments without `--start-as-scene-origin`; with scene-NED routes, the velocity driver keeps the route frame consistent.
